@@ -8,6 +8,7 @@ from typing import Dict, Any, List
 import requests
 import gpxpy
 import gpxpy.gpx
+from strava_config import load_client_credentials
 
 """
 strava_tracks.py
@@ -113,8 +114,7 @@ and exporting GPX.
 
 
 # ------------- CONFIG: EDIT THESE -------------
-CLIENT_ID = "127989"
-CLIENT_SECRET = "bdec5d496e731b5fd70526c0215d466b3fe70df7"
+CLIENT_ID, CLIENT_SECRET = load_client_credentials()
 ACTIVITY_ID = 16673694374  # <-- put your Strava activity ID here
 
 TOKEN_PATH = Path("strava_tokens.json")

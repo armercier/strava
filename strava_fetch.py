@@ -84,10 +84,10 @@ from pathlib import Path
 
 import requests
 
+from strava_config import load_client_credentials
 
 
-CLIENT_ID = "127989"
-CLIENT_SECRET = "bdec5d496e731b5fd70526c0215d466b3fe70df7"
+CLIENT_ID, CLIENT_SECRET = load_client_credentials()
 
 TOKEN_PATH = Path("strava_tokens.json")
 ACTIVITIES_PATH = Path("strava_activities.json")

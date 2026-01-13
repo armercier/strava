@@ -2,6 +2,8 @@ import requests
 import json
 from pathlib import Path
 
+from strava_config import load_client_credentials, load_auth_code
+
 """
 Short description:
 Utilities to exchange a Strava OAuth authorization code for access and refresh tokens
@@ -42,10 +44,9 @@ Usage notes:
 - Ensure the saved tokens file is protected and not checked into version control.
 """
 
-# >>> FILL THESE <<<
-CLIENT_ID = "127989"
-CLIENT_SECRET = "bdec5d496e731b5fd70526c0215d466b3fe70df7"
-AUTH_CODE = "ccbd3cbc34d2148b0298e4315c9dfc62ca362189"
+# Loaded from env vars or strava_client.json (see strava_config.py)
+CLIENT_ID, CLIENT_SECRET = load_client_credentials()
+AUTH_CODE = load_auth_code()
 
 TOKEN_PATH = Path("strava_tokens.json")
 

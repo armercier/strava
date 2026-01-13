@@ -1,0 +1,12 @@
+# ignoe the gpx, hr_streams and power_streams folders
+gpx/
+hr_streams/
+power_streams/
+
+# .pyc files
+*.pyc
+
+# .json files
+*.json
+
+strava_tokens.json

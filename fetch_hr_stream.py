@@ -1,10 +1,18 @@
 import json
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Set
+import time
+
+import pandas as pd
+import requests
+
 """
 fetch_hr_stream.py
 
 Module for retrieving heart rate (HR) and time streams from the Strava API for a
 given activity, saving token state to disk, and providing a simple script
-entrypoint that writes a CSV and plots the HR trace.
+entrypoint that writes cached CSVs for a date-filtered range of activities.
 
 Description
 -----------
@@ -14,7 +22,7 @@ This module performs the following tasks:
 - Fetches the "time" and "heartrate" streams for a specified activity using the
     Strava API.
 - Provides a __main__ script behavior that saves the fetched HR/time samples
-    to CSV and displays a simple matplotlib plot.
+    to CSV for all activities within a configurable date window.
 
 Security & configuration
 ------------------------
@@ -64,11 +72,9 @@ fetch_hr_stream(activity_id: int) -> tuple[list[int], list[int]]
 
 Script usage (when run as __main__)
 -----------------------------------
-- Set ACTIVITY_ID to a desired Strava activity id.
-- The script will fetch streams, write them to a CSV named
-    "hr_stream_{ACTIVITY_ID}.csv" with columns "t_s" and "hr_bpm", print a short
-    summary of sample count and the first 10 points, and display a matplotlib
-    plot of HR vs time.
+- Configure FETCH_START_DAYS_AGO / FETCH_END_DAYS_AGO below.
+- The script will fetch streams for matching activities in that window and write
+    CSVs named "hr_stream_<id>.csv" with columns "t_s" and "hr_bpm".
 
 Notes & edge cases
 ------------------
@@ -80,19 +86,33 @@ Notes & edge cases
 """
 
 
-from pathlib import Path
-import time
-import pandas as pd
-import matplotlib.pyplot as plt
-
-import requests
+from strava_config import load_client_credentials
 
 
-
-CLIENT_ID = "127989"
-CLIENT_SECRET = "bdec5d496e731b5fd70526c0215d466b3fe70df7"
+CLIENT_ID, CLIENT_SECRET = load_client_credentials()
 
 TOKEN_PATH = Path("strava_tokens.json")
+HR_DIR = Path("hr_streams")
+CSV_PATH = Path("activities_clean.csv")
+
+# Inclusive window in days ago, e.g., 7 to 30 fetches last month's worth.
+FETCH_START_DAYS_AGO = 2
+FETCH_END_DAYS_AGO = 11 * 365
+
+TARGET_SPORTS: Set[str] = {
+    "Run",
+    "Ride",
+    "Walk",
+    "Hike",
+    "NordicSki",
+    "BackcountrySki",
+    "AlpineSki",
+    "SkiTouring",
+    "StandUpPaddling",
+    "Kayaking",
+    "MountainBikeRide",
+    "TrailRun",
+}
 
 
 def load_tokens():
@@ -138,7 +158,14 @@ def fetch_hr_stream(activity_id: int):
     headers = {"Authorization": f"Bearer {access_token}"}
 
     resp = requests.get(url, params=params, headers=headers)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        status = getattr(resp, "status_code", None)
+        raise requests.HTTPError(
+            f"Failed to fetch HR stream for {activity_id} (status {status})",
+            response=resp,
+        ) from e
     streams = resp.json()
 
     # streams is a dict like:
@@ -152,17 +179,147 @@ def fetch_hr_stream(activity_id: int):
     return time_s, hr_bpm
 
 
-if __name__ == "__main__":
-    ACTIVITY_ID = 16673694374  # <--- put one of your activity ids here
-    t, hr = fetch_hr_stream(ACTIVITY_ID)
-    df = pd.DataFrame({"t_s": t, "hr_bpm": hr})
-    df.to_csv(f"hr_stream_{ACTIVITY_ID}.csv", index=False)
-    print(f"Got {len(hr)} HR samples.")
-    print("First 10 points:")
-    for ti, hi in list(zip(t, hr))[:10]:
-        print(ti, "sec ->", hi, "bpm")
+def get_hr_stream_cached(activity_id: int, use_cache: bool = True):
+    """
+    Return HR/time streams for an activity, using a cached CSV when available.
 
-    plt.plot(t, hr)
-    plt.xlabel("Time (s)")
-    plt.ylabel("Heart rate (bpm)")
-    plt.show()
+    If use_cache is True and hr_streams/hr_stream_<id>.csv exists, reuse it to
+    avoid an API call. Otherwise fetch from Strava, save to the cache folder,
+    and return the data.
+    """
+    HR_DIR.mkdir(exist_ok=True)
+    cached_path = HR_DIR / f"hr_stream_{activity_id}.csv"
+    legacy_path = Path(f"hr_stream_{activity_id}.csv")
+
+    if use_cache and cached_path.exists():
+        df = pd.read_csv(cached_path)
+        return df["t_s"].tolist(), df["hr_bpm"].tolist(), cached_path
+
+    if use_cache and not cached_path.exists() and legacy_path.exists():
+        df = pd.read_csv(legacy_path)
+        df.to_csv(cached_path, index=False)  # normalize location
+        return df["t_s"].tolist(), df["hr_bpm"].tolist(), cached_path
+
+    time_s, hr_bpm = fetch_hr_stream(activity_id)
+    df = pd.DataFrame({"t_s": time_s, "hr_bpm": hr_bpm})
+    df.to_csv(cached_path, index=False)
+    return time_s, hr_bpm, cached_path
+
+
+def load_and_filter_activities(start_days_ago: int, end_days_ago: int) -> pd.DataFrame:
+    """Load CSV and filter on sport + date window (only ones with HR data flagged)."""
+    if not CSV_PATH.exists():
+        raise SystemExit(f"CSV file not found: {CSV_PATH}")
+
+    df = pd.read_csv(CSV_PATH)
+
+    if "sport_type" in df.columns:
+        sport_col = "sport_type"
+    elif "sport" in df.columns:
+        sport_col = "sport"
+    elif "type" in df.columns:
+        sport_col = "type"
+    else:
+        raise RuntimeError("No sport column found (expected sport_type/sport/type).")
+
+    if "date" in df.columns:
+        df["activity_date"] = pd.to_datetime(df["date"]).dt.date
+    elif "start_date_local" in df.columns:
+        df["activity_date"] = pd.to_datetime(df["start_date_local"]).dt.date
+    else:
+        raise RuntimeError(
+            "No date column found (expected 'date' or 'start_date_local')."
+        )
+
+    recent_days, oldest_days = sorted((start_days_ago, end_days_ago))
+    today = datetime.today().date()
+    window_start = today - timedelta(days=oldest_days)
+    window_end = today - timedelta(days=recent_days)
+
+    if "has_heartrate" in df.columns:
+        hr_mask = df["has_heartrate"] == True
+    elif "average_heartrate" in df.columns:
+        hr_mask = df["average_heartrate"].notna()
+    else:
+        hr_mask = True  # keep all if no HR indicator column is present
+
+    # Avoid API calls when watt data is absent in the CSV.
+    if "average_watts" in df.columns:
+        power_mask = df["average_watts"].notna()
+    else:
+        power_mask = True
+
+    mask = (
+        df[sport_col].isin(TARGET_SPORTS)
+        & hr_mask
+        & power_mask
+        & df["activity_date"].between(window_start, window_end)
+    )
+    sub = df.loc[mask, ["id", sport_col, "activity_date"]].copy()
+    sub["id"] = sub["id"].astype(int)
+    return sub.sort_values("activity_date")
+
+
+def fetch_hr_streams_for_range(
+    start_days_ago: int = FETCH_START_DAYS_AGO,
+    end_days_ago: int = FETCH_END_DAYS_AGO,
+    use_cache: bool = True,
+) -> None:
+    """Download HR streams for all matching activities in the date window."""
+    df = load_and_filter_activities(start_days_ago, end_days_ago)
+    if df.empty:
+        print("No activities matching filters (sport + date window).")
+        return
+
+    HR_DIR.mkdir(exist_ok=True)
+    fetched = 0
+    cached = 0
+    skipped = 0
+
+    for _, row in df.iterrows():
+        act_id = int(row["id"])
+        sport = str(row.iloc[1])
+        act_date = row["activity_date"]
+        cached_path = HR_DIR / f"hr_stream_{act_id}.csv"
+        was_cached = cached_path.exists() if use_cache else False
+
+        print(f"{act_id} ({sport}, {act_date}): fetching HR stream...")
+        try:
+            _, _, path = get_hr_stream_cached(act_id, use_cache=use_cache)
+            if use_cache and was_cached:
+                cached += 1
+                print(f"  -> cached at {path.name}")
+            else:
+                fetched += 1
+                print(f"  -> saved {path.name}")
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status == 404:
+                print("  -> skipped (404 not found)")
+            elif status == 429:
+                print("  -> hit Strava rate limit (429). Stopping further requests.")
+                break
+            elif status is None or (isinstance(status, int) and status >= 500):
+                print(f"  -> skipped (Strava error {status or 'unknown'})")
+            else:
+                print(f"  -> skipped (HTTP error {status})")
+            skipped += 1
+            continue
+        except requests.RequestException as e:
+            print(f"  -> skipped (request error: {e})")
+            skipped += 1
+            continue
+
+    total = len(df)
+    print(
+        f"Done. Downloaded {fetched}, cached {cached}, skipped {skipped}, total considered {total}."
+    )
+
+
+if __name__ == "__main__":
+    # Adjust FETCH_START_DAYS_AGO / FETCH_END_DAYS_AGO above to control the window.
+    fetch_hr_streams_for_range(
+        start_days_ago=FETCH_START_DAYS_AGO,
+        end_days_ago=FETCH_END_DAYS_AGO,
+        use_cache=True,
+    )
