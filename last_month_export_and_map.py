@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple
 import pandas as pd
 import gpxpy
 import folium
+import requests
 
 # Import your existing GPX export function from your Strava module
 from strava_tracks import export_gpx_for_activity  # adjust name if needed
@@ -124,14 +125,20 @@ OUT_HTML = Path("last_month_sport_map.html")
 TARGET_SPORTS = {
     "Run",
     "Ride",
+    "Walk",
+    "Hike",
     "NordicSki",
     "BackcountrySki",
     "AlpineSki",
-    "SkiTouring",   # include both variants, Strava naming can vary
+    "SkiTouring",
+    "StandUpPaddling",
+    "Kayaking",
+    "MountainBikeRide",
+    "TrailRun"   # include both variants, Strava naming can vary
 }
 
-# How far back: last 30 days (change if you want calendar month logic)
-DAYS_BACK = 1000
+# How far back: last 3 years
+DAYS_BACK = 1 * 365
 # --------------------------
 
 
@@ -285,6 +292,7 @@ def main():
         gpx_path = GPX_DIR / f"activity_{act_id}.gpx"
 
         if not gpx_path.exists():
+            print(f"  -> no local GPX, downloading from Strava")
             try:
                 # Call your existing export; this can raise "No lat/lon data..."
                 gpx_path = export_gpx_for_activity(act_id)
@@ -296,6 +304,24 @@ def main():
                 else:
                     # unexpected error: re-raise
                     raise
+            except requests.HTTPError as e:
+                status = getattr(e.response, "status_code", None)
+                if status == 404:
+                    print(f"  -> skipping {act_id} (Strava returned 404)")
+                    continue
+                if status == 429:
+                    print("  -> hit Strava rate limit (429). Stopping further requests.")
+                    break
+                if status is None or (isinstance(status, int) and status >= 500):
+                    print(f"  -> skipping {act_id} (Strava error {status or 'unknown'})")
+                    continue
+                print(f"  -> skipping {act_id} (HTTP error {status})")
+                continue
+            except requests.RequestException as e:
+                print(f"  -> skipping {act_id} (request error: {e})")
+                continue
+        else:
+            print(f"  -> using cached GPX {gpx_path.name}")
 
         try:
             pts = read_gpx_points(gpx_path)

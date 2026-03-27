@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -21,6 +21,7 @@ from strava_fetch import (
 STATE_PATH = Path("sync_state.json")     # tracks the last successful sync date
 BOOTSTRAP_END_DAYS_AGO = 120             # initial window if no state exists
 START_DAYS_AGO = 10                       # always pull most recent to oldest
+ACTIVITY_BACKFILL_DAYS = 30              # always re-fetch this rolling window
 # --------------------------
 
 
@@ -80,7 +81,8 @@ def refresh_activities_table(end_days_ago: int) -> None:
             existing = []
     existing_by_id = {act.get("id"): act for act in existing if "id" in act}
 
-    # Use latest known activity start time as baseline to avoid missing new ones.
+    # Use latest known activity start time as baseline, but always include a
+    # rolling backfill window so backdated/manual activities are not missed.
     latest_start = None
     for act in existing_by_id.values():
         ts = act.get("start_date_local") or act.get("start_date")
@@ -88,6 +90,8 @@ def refresh_activities_table(end_days_ago: int) -> None:
             continue
         try:
             dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
             if latest_start is None or dt > latest_start:
                 latest_start = dt
         except ValueError:
@@ -95,11 +99,17 @@ def refresh_activities_table(end_days_ago: int) -> None:
 
     tokens = load_strava_tokens()
     access_token, _ = refresh_strava_token(tokens)
+    lookback_days = max(int(end_days_ago), int(ACTIVITY_BACKFILL_DAYS))
+    lookback_start_date = date.today() - timedelta(days=lookback_days)
+    lookback_after_dt = datetime.combine(
+        lookback_start_date, datetime.min.time(), tzinfo=timezone.utc
+    )
+
     if latest_start:
-        after_dt = latest_start - timedelta(hours=12)  # small buffer
+        latest_after_dt = latest_start - timedelta(hours=12)  # small buffer
+        after_dt = min(latest_after_dt, lookback_after_dt)
     else:
-        start_date = date.today() - timedelta(days=end_days_ago)
-        after_dt = datetime.combine(start_date, datetime.min.time())
+        after_dt = lookback_after_dt
 
     after_ts = int(after_dt.timestamp())
     fresh = fetch_recent_activities(access_token, after_ts)
