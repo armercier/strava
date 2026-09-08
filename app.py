@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import calendar
+from html import escape as html_escape
 import json
 import pickle
 import subprocess
@@ -23,17 +23,19 @@ from daily_sync import main as sync_latest
 from fetch_gpx_range import GPX_DIR
 from fetch_hr_stream import get_hr_stream_cached
 from fetch_power_stream import get_power_stream_cached
-from strava_tracks import export_gpx_for_activity
+from garmin_tracks import export_gpx_for_activity
 
 CSV_PATH = Path("activities_clean.csv")
 HR_ZONES_PATH = Path("hr_zones.json")
 OVERRIDES_PATH = Path("activity_overrides.json")
+MANUAL_ACTIVITIES_PATH = Path("manual_activities.json")
 WEEKLY_NOTES_PATH = Path("weekly_notes.json")
 HR_STREAMS_DIR = Path("hr_streams")
 YEAR_OVERVIEW_CACHE_DIR = Path("year_overview_cache")
 YEAR_SNAPSHOT_PREVIOUS_COUNT = 2
 FULL_MAP_HTML_PATH = Path("gpx_sport_map.html")
 FULL_MAP_BUILD_SCRIPT = Path("build_gpx_map.py")
+TRAINING_PLAN_CSV_PATH = Path("hm_to_kima_workout_plan.csv")
 HR_ZONE_COLORS = [
     "#9ca3af",  # Recovery
     "#3b82f6",  # Zone 1
@@ -42,7 +44,9 @@ HR_ZONE_COLORS = [
     "#b91c1c",  # Zone 4
     "#8b5cf6",  # Zone 5
 ]
-WEEKLY_PANEL_HEIGHT_PX = 140
+WEEKLY_PANEL_HEIGHT_PX = 190
+WEEKLY_ACTIVITY_BUTTON_SLOTS = 2
+WEEKLY_ACTIVITY_BUTTON_SLOT_PX = 50
 
 _FULL_MAP_BUILD_LOCK = threading.Lock()
 _FULL_MAP_BUILD_STATE = {
@@ -88,10 +92,173 @@ def save_weekly_note(week_start_date: date, note: str | None) -> None:
 
 
 NUMERIC_OVERRIDE_FIELDS = {
+    "distance",
+    "moving_time",
+    "average_speed",
     "total_elevation_gain",
     "average_watts",
     "average_heartrate",
 }
+TEXT_OVERRIDE_FIELDS = {
+    "sport",
+    "sport_type",
+    "type",
+}
+
+
+DEFAULT_MANUAL_SPORTS = [
+    "Run",
+    "TrailRun",
+    "Ride",
+    "MountainBikeRide",
+    "Walk",
+    "Hike",
+    "Workout",
+    "StrengthTraining",
+    "Swim",
+    "AlpineSki",
+    "BackcountrySki",
+    "NordicSki",
+]
+
+
+def load_manual_activities() -> list[dict]:
+    if not MANUAL_ACTIVITIES_PATH.exists():
+        return []
+    try:
+        data = json.loads(MANUAL_ACTIVITIES_PATH.read_text())
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
+def save_manual_activities(activities: list[dict]) -> None:
+    MANUAL_ACTIVITIES_PATH.write_text(
+        json.dumps(activities, indent=2, sort_keys=True)
+    )
+
+
+def _next_manual_activity_id(existing: list[dict]) -> int:
+    ids = []
+    for activity in existing:
+        try:
+            ids.append(int(activity.get("id")))
+        except (TypeError, ValueError):
+            continue
+    manual_ids = [activity_id for activity_id in ids if activity_id < 0]
+    return (min(manual_ids) - 1) if manual_ids else -1
+
+
+def create_manual_activity(
+    *,
+    activity_date: date,
+    name: str,
+    sport: str,
+    distance_km: float | None,
+    moving_time_h: float | None,
+    elapsed_time_h: float | None,
+    elevation_m: float | None,
+    average_heartrate: float | None,
+    max_heartrate: float | None,
+    average_cadence: float | None,
+    average_watts: float | None,
+    kilojoules: float | None,
+    notes: str,
+) -> int:
+    activities = load_manual_activities()
+    activity_id = _next_manual_activity_id(activities)
+    distance_m = float(distance_km or 0.0) * 1000.0
+    moving_s = float(moving_time_h or 0.0) * 3600.0
+    elapsed_s = float(elapsed_time_h if elapsed_time_h is not None else moving_time_h or 0.0) * 3600.0
+    sport = str(sport or "Workout").strip() or "Workout"
+    title = str(name or "").strip() or f"Manual {sport}"
+    activity = {
+        "id": activity_id,
+        "name": title,
+        "sport_type": sport,
+        "type": sport,
+        "sport": sport,
+        "start_date_local": activity_date.isoformat(),
+        "date": activity_date.isoformat(),
+        "distance": distance_m,
+        "moving_time": moving_s,
+        "elapsed_time": elapsed_s,
+        "total_elevation_gain": float(elevation_m or 0.0),
+        "average_heartrate": average_heartrate,
+        "max_heartrate": max_heartrate,
+        "average_speed": (distance_m / moving_s) if moving_s > 0 else None,
+        "average_cadence": average_cadence,
+        "average_watts": average_watts,
+        "kilojoules": kilojoules,
+        "source": "manual",
+        "manual": True,
+    }
+    activities.append(activity)
+    save_manual_activities(activities)
+
+    note_text = (notes or "").strip()
+    if note_text:
+        save_activity_overrides(activity_id, {"notes": note_text})
+    return activity_id
+
+
+def delete_manual_activity(activity_id: int) -> bool:
+    activities = load_manual_activities()
+    kept = []
+    for activity in activities:
+        try:
+            current_id = int(activity.get("id", 0))
+        except (TypeError, ValueError):
+            kept.append(activity)
+            continue
+        if current_id != int(activity_id):
+            kept.append(activity)
+    if len(kept) == len(activities):
+        return False
+    save_manual_activities(kept)
+    save_activity_overrides(
+        activity_id,
+        {
+            "distance": None,
+            "moving_time": None,
+            "average_speed": None,
+            "total_elevation_gain": None,
+            "average_watts": None,
+            "average_heartrate": None,
+            "notes": None,
+            "sport": None,
+            "sport_type": None,
+            "type": None,
+        },
+    )
+    return True
+
+
+def manual_activities_frame() -> pd.DataFrame:
+    activities = load_manual_activities()
+    if not activities:
+        return pd.DataFrame()
+    df = pd.DataFrame(activities)
+    if "start_date_local" not in df.columns and "date" in df.columns:
+        df["start_date_local"] = df["date"]
+    if "date" not in df.columns:
+        df["date"] = pd.to_datetime(df["start_date_local"], errors="coerce").dt.date
+    if "distance_km" not in df.columns and "distance" in df.columns:
+        df["distance_km"] = pd.to_numeric(df["distance"], errors="coerce") / 1000.0
+    if "moving_time_h" not in df.columns and "moving_time" in df.columns:
+        df["moving_time_h"] = pd.to_numeric(df["moving_time"], errors="coerce") / 3600.0
+    if "elev_km" not in df.columns and "total_elevation_gain" in df.columns:
+        df["elev_km"] = pd.to_numeric(df["total_elevation_gain"], errors="coerce") / 1000.0
+    if "sport" not in df.columns:
+        if "sport_type" in df.columns:
+            df["sport"] = df["sport_type"]
+        elif "type" in df.columns:
+            df["sport"] = df["type"]
+        else:
+            df["sport"] = "Workout"
+    return df
 
 
 def apply_activity_overrides(df: pd.DataFrame) -> pd.DataFrame:
@@ -112,6 +279,18 @@ def apply_activity_overrides(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         for col, raw_val in fields.items():
+            if col in TEXT_OVERRIDE_FIELDS:
+                text_val = str(raw_val).strip()
+                if not text_val:
+                    continue
+                for target_col in (
+                    ["sport", "sport_type", "type"] if col == "sport" else [col]
+                ):
+                    if target_col not in df.columns:
+                        df[target_col] = pd.NA
+                    df.loc[mask, target_col] = text_val
+                continue
+
             if col not in NUMERIC_OVERRIDE_FIELDS:
                 continue
             try:
@@ -121,6 +300,33 @@ def apply_activity_overrides(df: pd.DataFrame) -> pd.DataFrame:
             if col not in df.columns:
                 df[col] = pd.NA
             df.loc[mask, col] = val
+
+        # Keep the display/aggregate columns in sync with Strava's base-unit
+        # fields. Weekly and yearly totals prefer these convenience columns
+        # when they are present in the CSV.
+        if "distance" in fields:
+            distance_m = pd.to_numeric(df.loc[mask, "distance"], errors="coerce")
+            if "distance_km" not in df.columns:
+                df["distance_km"] = pd.NA
+            df.loc[mask, "distance_km"] = distance_m / 1000.0
+        if "moving_time" in fields:
+            moving_s = pd.to_numeric(df.loc[mask, "moving_time"], errors="coerce")
+            if "moving_time_h" not in df.columns:
+                df["moving_time_h"] = pd.NA
+            df.loc[mask, "moving_time_h"] = moving_s / 3600.0
+
+        # An explicit speed wins. Otherwise a distance/time edit should also
+        # refresh the activity's displayed speed or running pace.
+        if (
+            "average_speed" not in fields
+            and ("distance" in fields or "moving_time" in fields)
+        ):
+            if "average_speed" not in df.columns:
+                df["average_speed"] = pd.NA
+            distance_m = pd.to_numeric(df.loc[mask, "distance"], errors="coerce")
+            moving_s = pd.to_numeric(df.loc[mask, "moving_time"], errors="coerce")
+            derived_speed = distance_m.div(moving_s.where(moving_s > 0))
+            df.loc[mask, "average_speed"] = derived_speed
 
     return df
 
@@ -139,6 +345,12 @@ def save_activity_overrides(
             current.pop(field, None)
         elif field in NUMERIC_OVERRIDE_FIELDS:
             current[field] = float(value)
+        elif field in TEXT_OVERRIDE_FIELDS:
+            text_value = str(value).strip()
+            if text_value:
+                current[field] = text_value
+            else:
+                current.pop(field, None)
         else:
             text_value = str(value).strip()
             if text_value:
@@ -349,6 +561,10 @@ def get_full_map_status() -> dict:
 @st.cache_data
 def load_activities() -> pd.DataFrame:
     df = pd.read_csv(CSV_PATH)
+    manual_df = manual_activities_frame()
+    if not manual_df.empty:
+        manual_df = manual_df.dropna(axis=1, how="all")
+        df = pd.concat([df, manual_df], ignore_index=True, sort=False)
 
     if "date" in df.columns:
         df["activity_date"] = pd.to_datetime(df["date"]).dt.date
@@ -368,7 +584,110 @@ def load_activities() -> pd.DataFrame:
 
     df["id"] = df["id"].astype(int)
     df = apply_activity_overrides(df)
+    if "date" in df.columns:
+        df["activity_date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    elif "start_date_local" in df.columns:
+        df["activity_date"] = pd.to_datetime(
+            df["start_date_local"], errors="coerce", format="mixed"
+        ).dt.date
     return df
+
+
+@st.cache_data
+def load_training_plan() -> pd.DataFrame:
+    if not TRAINING_PLAN_CSV_PATH.exists():
+        raise FileNotFoundError(f"Training plan file not found: {TRAINING_PLAN_CSV_PATH}")
+
+    df = pd.read_csv(TRAINING_PLAN_CSV_PATH)
+
+    # Accept both plan schemas (v1 and v2) by normalizing core fields used by UI.
+    if "iso_week" not in df.columns and "week" in df.columns:
+        df["iso_week"] = df["week"]
+    if "session_order" not in df.columns and "session_id" in df.columns:
+        df["session_order"] = df["session_id"]
+    if "session_name" not in df.columns and "type" in df.columns:
+        df["session_name"] = df["type"]
+    if "session_description" not in df.columns and "description" in df.columns:
+        df["session_description"] = df["description"]
+    if "weekly_total_hours" not in df.columns and "total_hours" in df.columns:
+        df["weekly_total_hours"] = df["total_hours"]
+    if "weekly_run_sessions" not in df.columns and "runs" in df.columns:
+        df["weekly_run_sessions"] = df["runs"]
+    if "weekly_total_sessions" not in df.columns and "row_type" in df.columns:
+        session_counts = (
+            df[df["row_type"].astype(str) == "session"]
+            .assign(iso_week_num=pd.to_numeric(df["iso_week"], errors="coerce"))
+            .groupby("iso_week_num")
+            .size()
+            .to_dict()
+        )
+        iso_week_num = pd.to_numeric(df["iso_week"], errors="coerce")
+        df["weekly_total_sessions"] = [
+            int(session_counts.get(w, 0)) if not pd.isna(w) else pd.NA
+            for w in iso_week_num
+        ]
+    if "sport" not in df.columns:
+        if "type" in df.columns:
+            df["sport"] = df["type"]
+        else:
+            df["sport"] = ""
+
+    for col in ("week_start", "week_end"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
+
+    if "iso_week" in df.columns:
+        df["iso_week"] = pd.to_numeric(df["iso_week"], errors="coerce").astype("Int64")
+    if "session_order" in df.columns:
+        df["session_order"] = pd.to_numeric(df["session_order"], errors="coerce")
+    if "duration_min" in df.columns:
+        df["duration_min"] = pd.to_numeric(df["duration_min"], errors="coerce")
+    else:
+        # v2 fallback: derive per-session duration from weekly total hours.
+        if "row_type" in df.columns and "weekly_total_hours" in df.columns:
+            week_hours = (
+                df[df["row_type"].astype(str) == "week_summary"]
+                .copy()
+                .assign(iso_week_num=lambda t: pd.to_numeric(t["iso_week"], errors="coerce"))
+            )
+            week_hours["weekly_total_hours_num"] = pd.to_numeric(
+                week_hours["weekly_total_hours"], errors="coerce"
+            )
+            week_hours_map = (
+                week_hours.dropna(subset=["iso_week_num"])
+                .set_index("iso_week_num")["weekly_total_hours_num"]
+                .to_dict()
+            )
+
+            session_mask = df["row_type"].astype(str) == "session"
+            week_session_counts = (
+                df.loc[session_mask]
+                .assign(iso_week_num=lambda t: pd.to_numeric(t["iso_week"], errors="coerce"))
+                .groupby("iso_week_num")
+                .size()
+                .to_dict()
+            )
+
+            duration_vals = []
+            iso_week_num = pd.to_numeric(df["iso_week"], errors="coerce")
+            for idx, row in df.iterrows():
+                if str(row.get("row_type", "")) != "session":
+                    duration_vals.append(pd.NA)
+                    continue
+                w = iso_week_num.loc[idx]
+                weekly_h = week_hours_map.get(w)
+                session_count = week_session_counts.get(w, 0)
+                if pd.isna(weekly_h) or session_count <= 0:
+                    duration_vals.append(pd.NA)
+                else:
+                    duration_vals.append((float(weekly_h) * 60.0) / float(session_count))
+            df["duration_min"] = pd.to_numeric(pd.Series(duration_vals), errors="coerce")
+
+    return df
+
+
+def save_training_plan(df: pd.DataFrame) -> None:
+    df.to_csv(TRAINING_PLAN_CSV_PATH, index=False)
 
 
 def get_year_overview_bundle(
@@ -497,7 +816,7 @@ def get_year_overview_bundle(
 
 
 def ensure_gpx(activity_id: int) -> Path:
-    """Return path to GPX for this activity; export from Strava if missing."""
+    """Return path to GPX for this activity; export from Garmin if missing."""
     GPX_DIR.mkdir(exist_ok=True)
     gpx_path = GPX_DIR / f"activity_{activity_id}.gpx"
     if not gpx_path.exists():
@@ -899,7 +1218,7 @@ def _format_pace_from_speed(speed_mps: float | None) -> str | None:
 
 
 def _bucket_main_sport(sport: str) -> str | None:
-    s = (sport or "").strip().lower()
+    s = str(sport or "").strip().lower()
     if "nordic" in s:
         return "Nordic skiing"
     if "trail" in s:
@@ -910,20 +1229,26 @@ def _bucket_main_sport(sport: str) -> str | None:
         return "Running"
     if "swim" in s:
         return "Swimming"
-    if "Weight" in s or "strength" in s:
+    if "weight" in s or "strength" in s:
         return "Weight training"
     return None
 
 
 def _resolve_sport_bucket(sport: str, known_labels: list[str]) -> str:
-    s = (sport or "").strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "", str(sport or "").lower())
     for label in known_labels:
-        if s == label.strip().lower():
+        if s == re.sub(r"[^a-z0-9]+", "", label.lower()):
             return label
     bucket = _bucket_main_sport(sport)
     if bucket is not None:
-        return bucket
-    return "Other"
+        bucket_key = re.sub(r"[^a-z0-9]+", "", bucket.lower())
+        for label in known_labels:
+            if bucket_key == re.sub(r"[^a-z0-9]+", "", label.lower()):
+                return label
+    return next(
+        (label for label in known_labels if label.strip().lower() == "other"),
+        "Other",
+    )
 
 
 def _weekly_area_point_spec(y_field: str, y_title: str, height: int):
@@ -1131,7 +1456,10 @@ def build_interactive_map_plot_html(
     return f"""
     <div id="wrap-{activity_id}" style="display:flex; gap:16px;">
       <div id="map-{activity_id}" style="flex:1; height:520px;"></div>
-      <div id="plot-{activity_id}" style="flex:1; height:520px;"></div>
+      <div style="flex:1; display:flex; flex-direction:column; min-width:0;">
+        <div id="plot-{activity_id}" style="height:520px;"></div>
+        <div id="plot-controls-{activity_id}" style="display:flex; flex-wrap:wrap; gap:10px; margin-top:6px; font-size:12px;"></div>
+      </div>
     </div>
     <link
       rel="stylesheet"
@@ -1149,6 +1477,7 @@ def build_interactive_map_plot_html(
       const data = {payload};
       const mapId = "map-{activity_id}";
       const plotId = "plot-{activity_id}";
+      const controlsId = "plot-controls-{activity_id}";
 
       const map = L.map(mapId);
       L.tileLayer("https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
@@ -1167,6 +1496,60 @@ def build_interactive_map_plot_html(
         ? L.circleMarker(latlngs[0], {{radius: 6, color: "#c2410c", fillOpacity: 0.9}}).addTo(map)
         : null;
 
+      function computeVam(times, elevations) {{
+        if (!times || !elevations || times.length !== elevations.length || times.length < 2) return null;
+        const vam = new Array(times.length).fill(null);
+        for (let i = 1; i < times.length; i++) {{
+          const dt = Number(times[i]) - Number(times[i - 1]);
+          const de = Number(elevations[i]) - Number(elevations[i - 1]);
+          if (!Number.isFinite(dt) || !Number.isFinite(de) || dt <= 0) continue;
+          // Instant VAM in m/h from elevation deltas.
+          vam[i] = (de / dt) * 3600.0;
+        }}
+        return vam;
+      }}
+
+      function rollingMeanByTime(values, times, windowSeconds) {{
+        if (!values || !times || values.length === 0 || values.length !== times.length) return null;
+        const windowSize = Math.max(1, Number(windowSeconds) || 1);
+        const halfWindow = windowSize / 2.0;
+        const sums = new Array(values.length + 1).fill(0.0);
+        const counts = new Array(values.length + 1).fill(0);
+        const out = new Array(values.length).fill(null);
+
+        for (let i = 0; i < values.length; i++) {{
+          const v = values[i];
+          const isValid = v !== null && v !== undefined && Number.isFinite(v);
+          sums[i + 1] = sums[i] + (isValid ? v : 0.0);
+          counts[i + 1] = counts[i] + (isValid ? 1 : 0);
+        }}
+
+        let lo = 0;
+        let hi = -1;
+        for (let i = 0; i < values.length; i++) {{
+          const centerTime = Number(times[i]);
+          if (!Number.isFinite(centerTime)) continue;
+          while (lo < values.length && Number(times[lo]) < centerTime - halfWindow) lo += 1;
+          while (hi + 1 < values.length && Number(times[hi + 1]) <= centerTime + halfWindow) hi += 1;
+          const count = counts[hi + 1] - counts[lo];
+          out[i] = count > 0 ? (sums[hi + 1] - sums[lo]) / count : null;
+        }}
+        return out;
+      }}
+
+      function clampAbs(values, maxAbs) {{
+        if (!values) return null;
+        return values.map((v) => {{
+          if (v === null || v === undefined || !Number.isFinite(v)) return null;
+          if (v > maxAbs) return maxAbs;
+          if (v < -maxAbs) return -maxAbs;
+          return v;
+        }});
+      }}
+
+      const defaultVamSmoothingSeconds = 30;
+      let vamRaw = null;
+      let vamTraceIndex = -1;
       const traces = [];
       if (data.hr && data.t_hr) {{
         traces.push({{
@@ -1175,6 +1558,7 @@ def build_interactive_map_plot_html(
           mode: "lines",
           name: "HR (bpm)",
           line: {{color: "#FC4C02"}},
+          meta: "hr",
         }});
       }}
       if (data.elev && data.elev_t) {{
@@ -1185,7 +1569,25 @@ def build_interactive_map_plot_html(
           name: "Elevation (m)",
           yaxis: "y2",
           line: {{color: "#d94b0b"}},
+          meta: "elevation",
         }});
+        vamRaw = computeVam(data.elev_t, data.elev);
+        const vamSmoothed = vamRaw
+          ? rollingMeanByTime(vamRaw, data.elev_t, defaultVamSmoothingSeconds)
+          : null;
+        const vam = vamSmoothed ? clampAbs(vamSmoothed, 2500) : null;
+        if (vam) {{
+          vamTraceIndex = traces.length;
+          traces.push({{
+            x: data.elev_t,
+            y: vam,
+            mode: "lines",
+            name: "VAM (m/h)",
+            yaxis: "y4",
+            line: {{color: "#16a34a", width: 1.6}},
+            meta: "vam",
+          }});
+        }}
       }}
       if (data.power && data.t_power) {{
         traces.push({{
@@ -1195,18 +1597,35 @@ def build_interactive_map_plot_html(
           name: "Power (W)",
           yaxis: "y3",
           line: {{color: "#0ea5e9"}},
+          meta: "power",
         }});
       }}
 
       const layout = {{
+        paper_bgcolor: "#0d1016",
+        plot_bgcolor: "#0d1016",
+        font: {{color: "#f5f6f8", family: "Inter, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"}},
         margin: {{l: 40, r: 40, t: 20, b: 40}},
-        xaxis: {{title: "Time (s)"}},
-        yaxis: {{title: "HR"}},
+        xaxis: {{
+          title: "Time (s)",
+          gridcolor: "#252b36",
+          zerolinecolor: "#343b49",
+        }},
+        yaxis: {{
+          title: "HR",
+          gridcolor: "#252b36",
+          zerolinecolor: "#343b49",
+        }},
         yaxis2: {{
           title: "Elevation (m)",
           overlaying: "y",
           side: "right",
+          anchor: "free",
+          position: 0.90,
           showgrid: false,
+          zeroline: false,
+          titlefont: {{color: "#d94b0b"}},
+          tickfont: {{color: "#d94b0b"}},
         }},
         yaxis3: {{
           title: "Power (W)",
@@ -1215,13 +1634,89 @@ def build_interactive_map_plot_html(
           anchor: "free",
           position: 0.95,
           showgrid: false,
+          zeroline: false,
+          titlefont: {{color: "#0ea5e9"}},
+          tickfont: {{color: "#0ea5e9"}},
         }},
-        legend: {{orientation: "h", y: 1.1}},
+        yaxis4: {{
+          title: "VAM (m/h)",
+          overlaying: "y",
+          side: "right",
+          anchor: "free",
+          position: 1.0,
+          showgrid: false,
+          zeroline: false,
+          titlefont: {{color: "#16a34a"}},
+          tickfont: {{color: "#16a34a"}},
+        }},
+        legend: {{
+          orientation: "h",
+          y: 1.1,
+          bgcolor: "rgba(13, 16, 22, 0)",
+          font: {{color: "#f5f6f8"}},
+        }},
         hovermode: "x",
       }};
 
       Plotly.newPlot(plotId, traces, layout, {{displayModeBar: false, responsive: true}})
         .then((gd) => {{
+          const controls = document.getElementById(controlsId);
+          if (controls) {{
+            if (vamRaw && vamTraceIndex >= 0) {{
+              const smoothingControl = document.createElement("label");
+              smoothingControl.style.display = "inline-flex";
+              smoothingControl.style.alignItems = "center";
+              smoothingControl.style.gap = "7px";
+              smoothingControl.style.color = "#f3f4f6";
+              smoothingControl.style.paddingRight = "12px";
+              smoothingControl.style.borderRight = "1px solid #343b49";
+
+              const smoothingText = document.createElement("span");
+              smoothingText.textContent = `VAM smoothing: ${{defaultVamSmoothingSeconds}} s`;
+              smoothingText.style.minWidth = "126px";
+
+              const smoothingSlider = document.createElement("input");
+              smoothingSlider.type = "range";
+              smoothingSlider.min = "1";
+              smoothingSlider.max = "300";
+              smoothingSlider.step = "1";
+              smoothingSlider.value = String(defaultVamSmoothingSeconds);
+              smoothingSlider.setAttribute("aria-label", "VAM rolling-average smoothing in seconds");
+              smoothingSlider.style.width = "150px";
+              smoothingSlider.style.accentColor = "#16a34a";
+              smoothingSlider.addEventListener("input", () => {{
+                const smoothingSeconds = Number(smoothingSlider.value);
+                smoothingText.textContent = `VAM smoothing: ${{smoothingSeconds}} s`;
+                const updatedVam = clampAbs(
+                  rollingMeanByTime(vamRaw, data.elev_t, smoothingSeconds),
+                  2500
+                );
+                Plotly.restyle(gd, {{y: [updatedVam]}}, [vamTraceIndex]);
+              }});
+
+              smoothingControl.appendChild(smoothingText);
+              smoothingControl.appendChild(smoothingSlider);
+              controls.appendChild(smoothingControl);
+            }}
+            traces.forEach((trace, idx) => {{
+              const label = document.createElement("label");
+              label.style.display = "inline-flex";
+              label.style.alignItems = "center";
+              label.style.gap = "4px";
+              label.style.color = "#f3f4f6";
+              const checkbox = document.createElement("input");
+              checkbox.type = "checkbox";
+              checkbox.checked = true;
+              checkbox.style.width = "12px";
+              checkbox.style.height = "12px";
+              checkbox.addEventListener("change", () => {{
+                Plotly.restyle(gd, {{visible: checkbox.checked}}, [idx]);
+              }});
+              label.appendChild(checkbox);
+              label.appendChild(document.createTextNode(trace.name));
+              controls.appendChild(label);
+            }});
+          }}
           gd.on("plotly_hover", (evt) => {{
             if (!marker || !evt.points || !evt.points.length) return;
             const x = evt.points[0].x;
@@ -1306,12 +1801,541 @@ def render_available_stream_plots(*, t_hr, hr, t_power, power):
     return rendered
 
 
+# ---------- UI HELPERS ----------
+
+
+def render_app_theme() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --app-bg: #0d1016;
+            --app-panel: #151922;
+            --app-panel-soft: #1f232d;
+            --app-sidebar: #272a34;
+            --app-border: #3a4150;
+            --app-border-soft: #2d3340;
+            --app-text: #f5f6f8;
+            --app-muted: #a7adb8;
+            --app-orange: #FC4C02;
+            --app-orange-hover: #e04500;
+            --app-blue: #0ea5e9;
+            --app-green: #22c55e;
+            --app-nav-height: 3.15rem;
+        }
+
+        .stApp {
+            background: var(--app-bg);
+            color: var(--app-text);
+        }
+
+        [data-testid="stSidebar"] {
+            background: var(--app-sidebar);
+        }
+
+        [data-testid="stSidebar"] h2,
+        [data-testid="stSidebar"] h3,
+        [data-testid="stSidebar"] p,
+        [data-testid="stSidebar"] label,
+        [data-testid="stSidebar"] span {
+            color: var(--app-text);
+        }
+
+        [data-testid="stMainBlockContainer"] {
+            padding-top: 1.25rem;
+            max-width: 1560px;
+        }
+
+        h1, h2, h3, h4 {
+            letter-spacing: 0;
+        }
+
+        div[data-testid="stButton"] > button {
+            border-radius: 8px;
+            border-color: var(--app-border);
+            background: #12161f;
+            color: var(--app-text);
+            font-weight: 650;
+        }
+
+        div[data-testid="stButton"] > button:hover {
+            border-color: #5b6475;
+            color: var(--app-text);
+        }
+
+        div[data-testid="stButton"] > button[kind="primary"] {
+            background: var(--app-orange);
+            border-color: var(--app-orange);
+            color: #ffffff;
+        }
+
+        div[data-testid="stButton"] > button[kind="primary"]:hover {
+            background: var(--app-orange-hover);
+            border-color: var(--app-orange-hover);
+            color: #ffffff;
+        }
+
+        [data-testid="stSidebar"] div[data-testid="stButton"] > button {
+            font-size: 0.86rem;
+            min-height: 2.1rem;
+            padding: 0.35rem 0.55rem;
+        }
+
+        .app-brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin: 8px 0 24px 0;
+        }
+
+        .app-brand-mark {
+            width: 38px;
+            height: 38px;
+            border-radius: 8px;
+            background: var(--app-orange);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .app-brand-mark svg {
+            transform: rotate(180deg);
+            transform-origin: center;
+        }
+
+        .app-brand-name {
+            font-size: 1.05rem;
+            font-weight: 800;
+            letter-spacing: 0.04em;
+        }
+
+        .view-header {
+            display: flex;
+            align-items: flex-end;
+            justify-content: space-between;
+            gap: 18px;
+            margin: 1.9rem 0 1.1rem 0;
+        }
+
+        .view-header h2 {
+            margin: 0;
+            font-size: 1.9rem;
+            line-height: 1.14;
+            font-weight: 800;
+        }
+
+        .view-header .meta,
+        .section-label,
+        .sidebar-muted {
+            color: var(--app-muted);
+            font-size: 0.92rem;
+            font-weight: 550;
+        }
+
+        .section-title {
+            margin: 1.55rem 0 0.75rem 0;
+            font-size: 1.28rem;
+            font-weight: 780;
+            color: var(--app-text);
+        }
+
+        .metric-grid {
+            display: grid;
+            gap: 12px;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            margin: 0.7rem 0 1rem 0;
+        }
+
+        .metric-card {
+            min-height: 82px;
+            border: 1px solid var(--app-border-soft);
+            border-radius: 8px;
+            background: var(--app-panel);
+            padding: 14px 16px;
+        }
+
+        .metric-label {
+            color: var(--app-muted);
+            font-size: 0.78rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+
+        .metric-value {
+            color: var(--app-text);
+            font-size: 1.55rem;
+            line-height: 1.1;
+            font-weight: 760;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .metric-value.small {
+            font-size: 1.28rem;
+        }
+
+        .sidebar-panel {
+            border-top: 1px solid var(--app-border-soft);
+            padding-top: 18px;
+            margin-top: 18px;
+        }
+
+        .sidebar-panel h3 {
+            font-size: 1rem;
+            margin: 0 0 0.45rem 0;
+            font-weight: 780;
+        }
+
+        .sidebar-week {
+            border: 1px solid var(--app-border-soft);
+            background: rgba(13, 16, 22, 0.45);
+            border-radius: 8px;
+            padding: 12px;
+            margin: 0.65rem 0 0.8rem 0;
+        }
+
+        .sidebar-week .label {
+            color: var(--app-muted);
+            font-size: 0.78rem;
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+
+        .sidebar-week .value {
+            font-size: 1.02rem;
+            font-weight: 760;
+        }
+
+        .week-nav-row {
+            height: 0;
+            margin: 0;
+            padding: 0;
+        }
+
+        div[data-testid="stElementContainer"]:has(.week-nav-row) + div[data-testid="stHorizontalBlock"] {
+            margin: 0.35rem 0 1.25rem 0;
+            align-items: center;
+        }
+
+        div[data-testid="stElementContainer"]:has(.week-nav-row) + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button {
+            min-height: 2rem;
+            padding: 0.2rem 0.65rem;
+            font-size: 0.84rem;
+            border-radius: 7px;
+            background: transparent;
+            border-color: transparent;
+            color: var(--app-muted);
+        }
+
+        div[data-testid="stElementContainer"]:has(.week-nav-row) + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button:hover {
+            border-color: var(--app-border-soft);
+            color: var(--app-text);
+            background: rgba(21, 25, 34, 0.38);
+        }
+
+        .week-title {
+            text-align: center;
+            margin: 0;
+        }
+
+        .week-title h2 {
+            margin: 0;
+            font-size: 1.35rem;
+            line-height: 1.15;
+            font-weight: 800;
+        }
+
+        .week-title .meta {
+            margin-top: 0.18rem;
+            color: var(--app-muted);
+            font-size: 0.78rem;
+            font-weight: 720;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        .week-activity-slot-placeholder {
+            height: 50px;
+        }
+
+        .view-switch-row {
+            position: sticky;
+            top: 0;
+            z-index: 999;
+            min-height: var(--app-nav-height);
+            margin: -0.15rem 0 1.05rem 0;
+            padding: 0.45rem 0 0.2rem 0;
+            background: rgba(13, 16, 22, 0.94);
+            border-bottom: 1px solid var(--app-border-soft);
+            backdrop-filter: blur(12px);
+        }
+
+        div[data-testid="stStatusWidget"],
+        div[data-testid="stNotification"],
+        div[data-testid="stAlert"] {
+            scroll-margin-top: calc(var(--app-nav-height) + 1rem);
+        }
+
+        .view-switch-row div[data-testid="stButton"] > button {
+            min-height: 2rem;
+            padding: 0.15rem 0.35rem 0.45rem 0.35rem;
+            border: 0;
+            border-bottom: 2px solid transparent;
+            border-radius: 0;
+            background: transparent;
+            color: var(--app-muted);
+            font-size: 0.88rem;
+            font-weight: 760;
+            box-shadow: none;
+        }
+
+        .view-switch-row div[data-testid="stButton"] > button:hover {
+            border-color: transparent;
+            color: var(--app-text);
+            background: transparent;
+        }
+
+        .view-switch-row div[data-testid="stButton"] > button[kind="primary"] {
+            background: transparent;
+            border: 0;
+            border-bottom: 2px solid var(--app-orange);
+            color: var(--app-text);
+        }
+
+        .view-switch-row div[data-testid="stButton"] > button[kind="primary"]:hover {
+            background: transparent;
+            border-bottom-color: var(--app-orange);
+            color: var(--app-text);
+        }
+
+        [data-testid="stMetric"] {
+            border: 1px solid var(--app-border-soft);
+            border-radius: 8px;
+            background: var(--app-panel);
+            padding: 0.8rem 0.9rem;
+        }
+
+        [data-testid="stMetricLabel"] {
+            color: var(--app-muted);
+        }
+
+        .block-container hr {
+            border-color: var(--app-border-soft);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_brand() -> None:
+    st.sidebar.markdown(
+        """
+        <div class="app-brand">
+          <div class="app-brand-mark">
+            <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M13.45 3 L6.2 20 h4.3 l2.95-7 l2.95 7 h4.4 z" fill="#ffffff"/>
+              <path d="M13.45 13 L10.8 20 h2.65 z" fill="#ffffff"/>
+            </svg>
+          </div>
+          <div class="app-brand-name">stravapas</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_view_header(title: str, meta: str | None = None) -> None:
+    meta_html = f'<div class="meta">{meta}</div>' if meta else ""
+    st.markdown(
+        f"""
+        <div class="view-header">
+            <h2>{title}</h2>
+            {meta_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_top_nav(active_view: str) -> None:
+    st.markdown(
+        '<div class="view-switch-row">',
+        unsafe_allow_html=True,
+    )
+    view_labels = ["Week overview", "Activity detail", "Year overview", "Training plan"]
+    view_cols = st.columns(4)
+    for col, label in zip(view_cols, view_labels):
+        with col:
+            if st.button(
+                label,
+                key=f"switch_view_{label}",
+                type="primary" if active_view == label else "secondary",
+                width="stretch",
+            ):
+                st.session_state["active_tab"] = label
+                st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_week_title(week_start: date) -> None:
+    st.markdown(
+        f"""
+        <div class="week-title">
+            <h2>{format_week_range(week_start)}</h2>
+            <div class="meta">Week {week_start.isocalendar().week}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_section_title(title: str) -> None:
+    st.markdown(f'<div class="section-title">{title}</div>', unsafe_allow_html=True)
+
+
+def _display_value(value) -> str | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+    return str(value)
+
+
+def render_metric_cards(metrics: list[tuple[str, object]], columns: int | None = None) -> None:
+    visible = [(label, _display_value(value)) for label, value in metrics]
+    visible = [(label, value) for label, value in visible if value is not None and value != ""]
+    if not visible:
+        return
+    template = (
+        f"repeat({columns}, minmax(0, 1fr))"
+        if columns
+        else "repeat(auto-fit, minmax(150px, 1fr))"
+    )
+    cards = []
+    for label, value in visible:
+        value_class = "metric-value small" if len(value) > 14 else "metric-value"
+        safe_label = html_escape(str(label))
+        safe_value = html_escape(str(value))
+        cards.append(
+            f'<div class="metric-card"><div class="metric-label">{safe_label}</div>'
+            f'<div class="{value_class}">{safe_value}</div></div>'
+        )
+    st.markdown(
+        f'<div class="metric-grid" style="grid-template-columns:{template};">'
+        + "".join(cards)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _sport_options(existing_sports: list[str] | tuple[str, ...], current: str | None = None) -> list[str]:
+    sports = {str(s) for s in existing_sports if str(s).strip()}
+    sports.update(DEFAULT_MANUAL_SPORTS)
+    if current:
+        sports.add(str(current))
+    return sorted(sports)
+
+
+def render_manual_activity_entry_form(
+    default_date: date,
+    existing_sports: list[str] | tuple[str, ...],
+) -> None:
+    render_section_title("Manual activity")
+    st.caption("Saved in `manual_activities.json` and included in weekly/year totals.")
+    with st.form(key=f"manual_activity_create_{default_date.isoformat()}"):
+        c1, c2 = st.columns(2)
+        activity_date_input = c1.date_input("Date", value=default_date)
+        sport_choice = c2.selectbox(
+            "Activity type",
+            _sport_options(existing_sports),
+            index=_sport_options(existing_sports).index("Run")
+            if "Run" in _sport_options(existing_sports)
+            else 0,
+        )
+        name_input = st.text_input(
+            "Name",
+            value=f"Manual {sport_choice}",
+            placeholder="Manual activity name",
+        )
+        m1, m2, m3 = st.columns(3)
+        distance_input = m1.text_input("Distance (km)", value="", placeholder="0")
+        moving_input = m2.text_input("Moving time (h)", value="", placeholder="1.25")
+        elapsed_input = m3.text_input("Elapsed time (h)", value="", placeholder="optional")
+        m4, m5, m6 = st.columns(3)
+        elev_input = m4.text_input("Elevation gain (m)", value="", placeholder="0")
+        cadence_input = m5.text_input("Average cadence", value="", placeholder="optional")
+        kjs_input = m6.text_input("Work (kJ)", value="", placeholder="optional")
+        h1, h2, h3 = st.columns(3)
+        avg_hr_input = h1.text_input("Average HR (bpm)", value="", placeholder="optional")
+        max_hr_input = h2.text_input("Max HR (bpm)", value="", placeholder="optional")
+        avg_power_input = h3.text_input("Average power (W)", value="", placeholder="optional")
+        notes_input = st.text_area("Notes", value="", height=90)
+        s1, s2 = st.columns(2)
+        save_clicked = s1.form_submit_button("Add activity")
+        cancel_clicked = s2.form_submit_button("Cancel")
+
+    if cancel_clicked:
+        st.session_state.pop("manual_activity_date", None)
+        st.rerun()
+
+    if save_clicked:
+        try:
+            activity_id = create_manual_activity(
+                activity_date=activity_date_input,
+                name=name_input,
+                sport=sport_choice,
+                distance_km=parse_optional_float(distance_input),
+                moving_time_h=parse_optional_float(moving_input),
+                elapsed_time_h=parse_optional_float(elapsed_input),
+                elevation_m=parse_optional_float(elev_input),
+                average_heartrate=parse_optional_float(avg_hr_input),
+                max_heartrate=parse_optional_float(max_hr_input),
+                average_cadence=parse_optional_float(cadence_input),
+                average_watts=parse_optional_float(avg_power_input),
+                kilojoules=parse_optional_float(kjs_input),
+                notes=notes_input,
+            )
+        except ValueError:
+            st.error("Invalid number format. Use values like `10.5`, `1.25`, or leave blank.")
+        else:
+            load_activities.clear()
+            st.session_state["selected_activity_id"] = activity_id
+            st.session_state["selected_date"] = activity_date_input
+            st.session_state["week_pick"] = activity_date_input
+            st.session_state["calendar_month"] = date(
+                activity_date_input.year,
+                activity_date_input.month,
+                1,
+            )
+            st.session_state.pop("manual_activity_date", None)
+            st.success("Manual activity added.")
+            st.rerun()
+
+
+def format_week_range(week_start: date) -> str:
+    week_end = week_start + timedelta(days=6)
+    if week_start.month == week_end.month:
+        return f"{week_start.strftime('%b')} {week_start.day}-{week_end.day}, {week_start.year}"
+    return f"{week_start.strftime('%b')} {week_start.day} - {week_end.strftime('%b')} {week_end.day}, {week_start.year}"
+
+
 # ---------- STREAMLIT APP ----------
 
 
 def main():
-    st.set_page_config(page_title="Training Calendar", layout="wide")
-    st.title("Training Calendar")
+    st.set_page_config(page_title="stravapas", layout="wide")
+    render_app_theme()
+
+    if "active_tab" not in st.session_state:
+        st.session_state["active_tab"] = "Week overview"
+    if "pending_view" in st.session_state:
+        st.session_state["active_tab"] = st.session_state.pop("pending_view")
+    render_top_nav(st.session_state["active_tab"])
 
     if "ran_sync" not in st.session_state:
         with st.spinner("Syncing latest activities (GPX/HR/Power)..."):
@@ -1323,7 +2347,11 @@ def main():
                 st.session_state["ran_sync"] = False
 
     df = load_activities()
-    start_full_map_build(force=False)
+    # Auto-trigger map build only once per Streamlit session to avoid spawning
+    # repeated background python processes on every rerun.
+    if "auto_map_build_started" not in st.session_state:
+        start_full_map_build(force=False)
+        st.session_state["auto_map_build_started"] = True
     all_dates = sorted(df["activity_date"].unique())
     last_activity_date = max(all_dates) if all_dates else date.today()
     if "selected_activity_id" not in st.session_state:
@@ -1333,81 +2361,7 @@ def main():
 
     default_date = last_activity_date
 
-    st.sidebar.markdown(
-        """
-        <style>
-        [data-testid="stSidebar"] .stButton > button {
-            font-size: 12px;
-            padding: 0.15rem 0.1rem;
-            line-height: 1.1;
-            white-space: nowrap;
-        }
-        [data-testid="stSidebar"] .stButton > button[kind="primary"] {
-            background: #FC4C02;
-            border-color: #FC4C02;
-            color: #ffffff;
-        }
-        [data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {
-            background: #e04500;
-            border-color: #e04500;
-            color: #ffffff;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        """
-        <style>
-        [data-testid="stButton"] > button[kind="primary"] {
-            background: #FC4C02;
-            border-color: #FC4C02;
-            color: #ffffff;
-        }
-        [data-testid="stButton"] > button[kind="primary"]:hover {
-            background: #e04500;
-            border-color: #e04500;
-            color: #ffffff;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.sidebar.markdown(
-"""
-    <div style="display:flex; align-items:center; gap:10px; margin:6px 0 14px 0;">
-      <div style="
-          width:38px;
-          height:38px;
-          border-radius:8px;
-          background:#FC4C02;
-          display:flex;
-          align-items:center;
-          justify-content:center;
-      ">
-        <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
-          <!-- Large triangle -->
-          <path d="M13.45 3 L6.2 20 h4.3 l2.95-7 l2.95 7 h4.4 z"
-                fill="#ffffff"/>
-          <!-- Small triangle -->
-          <path d="M13.45 13 L10.8 20 h2.65 z"
-                fill="#ffffff"/>
-        </svg>
-      </div>
-
-      <div style="
-          font-weight:700;
-          font-size:18px;
-          letter-spacing:0.6px;
-          font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      ">
-        STRAVA
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+    render_brand()
 
     selected_sports = df["sport"].dropna().unique().tolist()
     selected_sports_key = tuple(selected_sports)
@@ -1417,6 +2371,7 @@ def main():
     else:
         year_options = [date.today().year]
     overrides_mtime_ns = _path_mtime_ns(OVERRIDES_PATH)
+    manual_mtime_ns = _path_mtime_ns(MANUAL_ACTIVITIES_PATH)
     zones_mtime_ns = _path_mtime_ns(HR_ZONES_PATH)
     current_year = date.today().year
     latest_year = year_options[-1]
@@ -1427,6 +2382,7 @@ def main():
         snapshot_years,
         selected_sports_key,
         overrides_mtime_ns,
+        manual_mtime_ns,
         zones_mtime_ns,
     )
     if st.session_state.get("year_snapshot_init_key") != snapshot_init_key:
@@ -1459,62 +2415,39 @@ def main():
         days=st.session_state["week_pick"].weekday()
     )
     display_week_end = display_week_start + timedelta(days=6)
+    # Week navigation is intentionally allowed beyond the recorded activity
+    # range. Keep the date input bounds wide enough to include that state so a
+    # previous/next navigation click cannot leave the widget with an invalid
+    # default value.
+    sidebar_date_candidates = [*all_dates, display_week_start]
+    sidebar_date_min = min(sidebar_date_candidates)
+    sidebar_date_max = max(sidebar_date_candidates)
 
-    cal_month = st.session_state["calendar_month"]
-    st.sidebar.markdown("### Week selection")
-    nav_cols = st.sidebar.columns([1, 4, 1])
-    with nav_cols[0]:
-        if st.button("◀", key="cal_prev", width='stretch'):
-            year = cal_month.year
-            month = cal_month.month - 1
-            if month == 0:
-                month = 12
-                year -= 1
-            st.session_state["calendar_month"] = date(year, month, 1)
-            cal_month = st.session_state["calendar_month"]
-    with nav_cols[2]:
-        if st.button("▶", key="cal_next", width='stretch'):
-            year = cal_month.year
-            month = cal_month.month + 1
-            if month == 13:
-                month = 1
-                year += 1
-            st.session_state["calendar_month"] = date(year, month, 1)
-            cal_month = st.session_state["calendar_month"]
     st.sidebar.markdown(
-        f"**{calendar.month_name[cal_month.month]} {cal_month.year}**"
+        f"""
+        <div class="sidebar-panel">
+            <h3>Current week</h3>
+            <div class="sidebar-week">
+                <div class="value">{format_week_range(display_week_start)}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
+    jump_date = st.sidebar.date_input(
+        "Jump to week",
+        value=display_week_start,
+        min_value=sidebar_date_min,
+        max_value=sidebar_date_max,
+        key=f"sidebar_week_jump_{display_week_start.isoformat()}",
+    )
+    if jump_date != display_week_start:
+        st.session_state["week_pick"] = jump_date
+        st.session_state["calendar_month"] = date(jump_date.year, jump_date.month, 1)
+        st.session_state["pending_view"] = "Week overview"
+        st.rerun()
 
-    weekday_labels = ["Wk", "M", "T", "W", "T", "F", "S", "S"]
-    header_cols = st.sidebar.columns(8)
-    for col, label in zip(header_cols, weekday_labels):
-        col.markdown(f"**{label}**")
-
-    cal = calendar.Calendar(firstweekday=0)
-    month_weeks = cal.monthdatescalendar(cal_month.year, cal_month.month)
-    for week in month_weeks:
-        week_cols = st.sidebar.columns(8)
-        week_num = week[0].isocalendar().week
-        week_has_selected_day = any(display_week_start <= d <= display_week_end for d in week)
-        if week_has_selected_day:
-            week_cols[0].markdown(f"<span style='color:#FC4C02; font-weight:700;'>{week_num}</span>", unsafe_allow_html=True)
-        else:
-            week_cols[0].markdown(f"**{week_num}**")
-        for col, day in zip(week_cols[1:], week):
-            is_current_month = day.month == cal_month.month
-            label = str(day.day)
-            is_in_displayed_week = display_week_start <= day <= display_week_end
-            if col.button(
-                label,
-                key=f"cal_{day.isoformat()}",
-                disabled=not is_current_month,
-                type="primary" if is_in_displayed_week and is_current_month else "secondary",
-                width='stretch',
-            ):
-                st.session_state["week_pick"] = day
-                st.session_state["pending_view"] = "Week overview"
-
-    st.sidebar.markdown("### Full sport map")
+    st.sidebar.markdown('<div class="sidebar-panel"><h3>Full sport map</h3></div>', unsafe_allow_html=True)
     full_map_status = get_full_map_status()
     if full_map_status["running"]:
         st.sidebar.caption("Status: building in background...")
@@ -1536,41 +2469,10 @@ def main():
         else:
             st.sidebar.info("Map build already running.")
 
-    if "active_tab" not in st.session_state:
-        st.session_state["active_tab"] = "Week overview"
-    if "pending_view" in st.session_state:
-        st.session_state["active_tab"] = st.session_state.pop("pending_view")
-    st.markdown(
-        """
-        <style>
-        [data-testid="stMain"] .view-switch-row [data-testid="stButton"] > button {
-            font-size: 16px;
-            font-weight: 700;
-            padding: 0.55rem 0.8rem;
-            border-radius: 10px;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.markdown('<div class="view-switch-row">', unsafe_allow_html=True)
-    view_labels = ["Week overview", "Activity detail", "Year overview"]
-    view_cols = st.columns(3)
-    for col, label in zip(view_cols, view_labels):
-        with col:
-            if st.button(
-                label,
-                key=f"switch_view_{label}",
-                type="primary" if st.session_state["active_tab"] == label else "secondary",
-                width='stretch',
-            ):
-                st.session_state["active_tab"] = label
-                st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
     view = st.session_state["active_tab"]
 
     if view == "Full map":
-        st.subheader("Full sport map")
+        render_view_header("Full sport map")
         status = get_full_map_status()
         c1, c2 = st.columns([1, 1])
         with c1:
@@ -1600,18 +2502,27 @@ def main():
         ref_day = st.session_state["week_pick"]
 
         week_start = ref_day - timedelta(days=ref_day.weekday())  # Monday
+        week_end = week_start + timedelta(days=6)
         week_dates = [week_start + timedelta(days=i) for i in range(7)]
-        nav_left, nav_title, nav_right = st.columns([1, 6, 1])
+        st.markdown('<div class="week-nav-row"></div>', unsafe_allow_html=True)
+        nav_left, nav_title, nav_add, nav_right = st.columns([1, 5, 0.55, 1])
         with nav_left:
-            if st.button("◀", key=f"week_prev_{week_start.isoformat()}", type="primary", width='stretch'):
+            if st.button("← Previous", key=f"week_prev_{week_start.isoformat()}", width='stretch'):
                 new_week = week_start - timedelta(days=7)
                 st.session_state["week_pick"] = new_week
                 st.session_state["calendar_month"] = date(new_week.year, new_week.month, 1)
                 st.rerun()
         with nav_title:
-            st.subheader(f"Week of {week_start.isoformat()}")
+            render_week_title(week_start)
+        with nav_add:
+            if st.button("+", key=f"add_manual_activity_week_{week_start.isoformat()}", help="Add manual activity", width="stretch"):
+                today = date.today()
+                st.session_state["manual_activity_date"] = (
+                    today if week_start <= today <= week_end else week_start
+                )
+                st.rerun()
         with nav_right:
-            if st.button("▶", key=f"week_next_{week_start.isoformat()}", type="primary", width='stretch'):
+            if st.button("Next →", key=f"week_next_{week_start.isoformat()}", width='stretch'):
                 new_week = week_start + timedelta(days=7)
                 st.session_state["week_pick"] = new_week
                 st.session_state["calendar_month"] = date(new_week.year, new_week.month, 1)
@@ -1640,6 +2551,7 @@ def main():
                 st.success("Weekly note cleared.")
                 st.rerun()
         zones = load_hr_zones(HR_ZONES_PATH)
+        show_zone_mini = st.toggle("Show zone mini charts", value=False, key="week_show_zone_mini")
         cols = st.columns(7)
         for col, d in zip(cols, week_dates):
             day_acts = df[
@@ -1670,9 +2582,18 @@ def main():
                             continue
                     st.session_state[day_select_key] = selected_idx_from_state
 
-                def _day_act_label(idx: int) -> str:
+                def _activity_summary_label(idx: int) -> str:
                     row = day_rows.iloc[idx]
-                    return f"{row['sport']} – {row.get('name', '')}"
+                    sport = str(row.get("sport", "Activity"))
+                    if pd.notna(row.get("distance_km")):
+                        dist_km = float(row.get("distance_km", 0.0))
+                    else:
+                        dist_km = float(row.get("distance", 0.0) or 0.0) / 1000.0
+                    if pd.notna(row.get("moving_time_h")):
+                        time_h = float(row.get("moving_time_h", 0.0))
+                    else:
+                        time_h = float(row.get("moving_time", 0.0) or 0.0) / 3600.0
+                    return f"{sport} · {dist_km:.1f} km · {time_h:.2f} h"
 
                 selected_row_for_map = day_rows.iloc[selected_idx_from_state]
                 selected_act_id_for_map = int(selected_row_for_map["id"])
@@ -1682,36 +2603,59 @@ def main():
                     mini_html = make_osm_map_mini(pts, height_px=WEEKLY_PANEL_HEIGHT_PX)
                     html(mini_html, height=WEEKLY_PANEL_HEIGHT_PX)
                 except Exception:
+                    no_map_html = (
+                        f"<div style='height:{WEEKLY_PANEL_HEIGHT_PX}px; width:100%; box-sizing:border-box; "
+                        "display:flex; align-items:center; justify-content:center; "
+                        "font-size:0.82rem; color:#9ca3af;'>"
+                        "No map</div>"
+                    )
+                    html(no_map_html, height=WEEKLY_PANEL_HEIGHT_PX)
+
+                if day_indices:
+                    first_idx = int(day_indices[0])
+                    first_row = day_rows.iloc[first_idx]
+                    first_act_id = int(first_row["id"])
+                    first_label = _activity_summary_label(first_idx)
+                    if col.button(
+                        first_label,
+                        key=f"open_direct_{first_act_id}_{d.isoformat()}",
+                        width="stretch",
+                    ):
+                        st.session_state["selected_activity_id"] = first_act_id
+                        st.session_state["selected_date"] = d
+                        st.session_state["pending_view"] = "Activity detail"
+                        try:
+                            st.experimental_rerun()  # older Streamlit versions
+                        except AttributeError:
+                            st.rerun()  # newer Streamlit
+
+                for idx in day_indices[1:WEEKLY_ACTIVITY_BUTTON_SLOTS]:
+                    idx = int(idx)
+                    act_row = day_rows.iloc[idx]
+                    act_id = int(act_row["id"])
+                    summary_label = _activity_summary_label(idx)
+                    if col.button(
+                        summary_label,
+                        key=f"open_direct_{act_id}_{d.isoformat()}",
+                        width="stretch",
+                    ):
+                        st.session_state["selected_activity_id"] = act_id
+                        st.session_state["selected_date"] = d
+                        st.session_state["pending_view"] = "Activity detail"
+                        try:
+                            st.experimental_rerun()  # older Streamlit versions
+                        except AttributeError:
+                            st.rerun()  # newer Streamlit
+
+                displayed_activity_slots = min(len(day_indices), WEEKLY_ACTIVITY_BUTTON_SLOTS)
+                for _ in range(WEEKLY_ACTIVITY_BUTTON_SLOTS - displayed_activity_slots):
                     col.markdown(
-                        f"<div style='height:{WEEKLY_PANEL_HEIGHT_PX}px; display:flex; align-items:center; justify-content:center; font-size:0.8rem; color:#6b7280; border:1px dashed #d1d5db; border-radius:6px;'>Map unavailable</div>",
+                        f"<div class='week-activity-slot-placeholder' "
+                        f"style='height:{WEEKLY_ACTIVITY_BUTTON_SLOT_PX}px;'></div>",
                         unsafe_allow_html=True,
                     )
 
-                selected_idx = col.selectbox(
-                    "Activity",
-                    options=day_indices,
-                    format_func=_day_act_label,
-                    key=day_select_key,
-                    label_visibility="collapsed",
-                )
-                selected_row = day_rows.iloc[int(selected_idx)]
-                selected_act_id = int(selected_row["id"])
-
-                if col.button(
-                    "Open selected activity",
-                    key=f"open_selected_{selected_act_id}_{d.isoformat()}",
-                    width='stretch',
-                ):
-                    st.session_state["selected_activity_id"] = selected_act_id
-                    st.session_state["selected_date"] = d
-                    st.session_state["pending_view"] = "Activity detail"
-                    try:
-                        st.experimental_rerun()  # older Streamlit versions
-                    except AttributeError:
-                        st.rerun()  # newer Streamlit
-
-                col.caption(f"{len(day_rows)} activit{'y' if len(day_rows) == 1 else 'ies'}")
-                if zones and not day_acts.empty:
+                if show_zone_mini and zones and not day_acts.empty:
                     day_ids = day_acts["id"].astype(int).tolist()
                     zone_totals, _, _ = compute_zone_totals_for_activities(
                         day_ids, zones, activities_df=day_acts
@@ -1759,12 +2703,18 @@ def main():
                         unsafe_allow_html=True,
                     )
 
-        st.markdown("### Weekly summary")
-        week_end = week_start + timedelta(days=6)
+        manual_activity_date = st.session_state.get("manual_activity_date")
+        if isinstance(manual_activity_date, date):
+            render_manual_activity_entry_form(manual_activity_date, selected_sports)
+
+        render_section_title("Weekly summary")
         week_df = df[
             (df["activity_date"] >= week_start)
             & (df["activity_date"] <= week_end)
             & (df["sport"].isin(selected_sports))
+        ].copy()
+        week_df_all = df[
+            (df["activity_date"] >= week_start) & (df["activity_date"] <= week_end)
         ].copy()
 
         if week_df.empty:
@@ -1782,10 +2732,57 @@ def main():
 
             total_elev_m = week_df["total_elevation_gain"].fillna(0).sum()
 
-            s1, s2, s3 = st.columns(3)
-            s1.metric("Total time (h)", f"{total_time_h:.2f}")
-            s2.metric("Total distance (km)", f"{total_distance_km:.1f}")
-            s3.metric("Total elevation gain (m)", f"{total_elev_m:.0f}")
+            render_metric_cards(
+                [
+                    ("Total time", f"{total_time_h:.2f} h"),
+                    ("Total distance", f"{total_distance_km:.1f} km"),
+                    ("Elevation gain", f"{total_elev_m:.0f} m"),
+                ],
+                columns=3,
+            )
+
+            def _sport_summary_metrics(frame: pd.DataFrame, sport_key: str) -> tuple[float, float]:
+                sport_series = frame.get("sport")
+                if sport_series is None:
+                    return 0.0, 0.0
+                sport_norm = sport_series.astype(str).str.lower()
+                if sport_key == "run":
+                    mask = sport_norm.str.contains("run", na=False)
+                elif sport_key == "bike":
+                    mask = (
+                        sport_norm.str.contains("ride", na=False)
+                        | sport_norm.str.contains("cycle", na=False)
+                        | sport_norm.str.contains("bike", na=False)
+                    )
+                else:
+                    return 0.0, 0.0
+
+                sub = frame.loc[mask].copy()
+                if sub.empty:
+                    return 0.0, 0.0
+
+                if "moving_time_h" in sub.columns:
+                    hours = float(sub["moving_time_h"].fillna(0).sum())
+                else:
+                    hours = float(sub["moving_time"].fillna(0).sum()) / 3600.0
+
+                if "distance_km" in sub.columns:
+                    distance_km = float(sub["distance_km"].fillna(0).sum())
+                else:
+                    distance_km = float(sub["distance"].fillna(0).sum()) / 1000.0
+                return hours, distance_km
+
+            run_h, run_km = _sport_summary_metrics(week_df_all, "run")
+            bike_h, bike_km = _sport_summary_metrics(week_df_all, "bike")
+
+            render_section_title("By sport")
+            render_metric_cards(
+                [
+                    ("Running", f"{run_h:.2f} h / {run_km:.1f} km"),
+                    ("Biking", f"{bike_h:.2f} h / {bike_km:.1f} km"),
+                ],
+                columns=2,
+            )
 
             zones = load_hr_zones(HR_ZONES_PATH)
             if not zones:
@@ -1799,7 +2796,7 @@ def main():
                 else:
                     chart_df = build_zone_chart_df(zone_totals, zones)
                     chart_df["zone"] = chart_df["label"]
-                    st.markdown("### Time in HR zones")
+                    render_section_title("Time in HR zones")
                     st.vega_lite_chart(
                         chart_df,
                         {
@@ -1856,7 +2853,10 @@ def main():
             & (df["sport"].isin(selected_sports))
         ].copy()
 
-        st.subheader(f"Activities on {selected_date}")
+        render_view_header(
+            "Activity detail",
+            f"{selected_date.strftime('%a %b %d, %Y')}",
+        )
 
         if day_df.empty:
             st.info("No activities for this date with selected sports.")
@@ -1887,7 +2887,7 @@ def main():
         col_metrics = st.container()
 
         with col_metrics:
-            st.markdown("### Summary")
+            render_section_title("Summary")
 
             distance_km = act_row.get("distance_km") or (
                 act_row.get("distance", 0) / 1000.0
@@ -1903,32 +2903,50 @@ def main():
             kjs = act_row.get("kilojoules", None)
             avg_speed_mps = _get_avg_speed_mps(act_row)
 
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Sport", act_row["sport"])
-            m2.metric("Distance (km)", f"{distance_km:.1f}")
-            m3.metric("Moving time (h)", f"{moving_h:.2f}")
-            m4.metric("Elevation gain (m)", f"{elev:.0f}")
-
-            m5, m6, m7, m8, m9 = st.columns(5)
-            if avg_hr is not None:
-                m5.metric("Avg HR", f"{avg_hr:.0f} bpm")
-            if max_hr is not None:
-                m6.metric("Max HR", f"{max_hr:.0f} bpm")
+            primary_metrics = [
+                ("Sport", act_row["sport"]),
+                ("Distance", f"{distance_km:.1f} km"),
+                ("Moving time", f"{moving_h:.2f} h"),
+                ("Elevation gain", f"{elev:.0f} m"),
+            ]
+            secondary_metrics = []
+            if avg_hr is not None and pd.notna(avg_hr):
+                secondary_metrics.append(("Avg HR", f"{avg_hr:.0f} bpm"))
+            if max_hr is not None and pd.notna(max_hr):
+                secondary_metrics.append(("Max HR", f"{max_hr:.0f} bpm"))
             if _is_bike_sport(act_row["sport"]):
                 if avg_speed_mps is not None:
-                    m7.metric("Avg speed (km/h)", f"{avg_speed_mps * 3.6:.1f}")
+                    secondary_metrics.append(("Avg speed", f"{avg_speed_mps * 3.6:.1f} km/h"))
             elif _is_run_sport(act_row["sport"]):
                 pace = _format_pace_from_speed(avg_speed_mps)
                 if pace is not None:
-                    m7.metric("Pace", pace)
+                    secondary_metrics.append(("Pace", pace))
             if avg_watts is not None and pd.notna(avg_watts):
-                m8.metric("Avg power (W)", f"{avg_watts:.0f}")
-            if kjs is not None:
-                m9.metric("Work (kJ)", f"{kjs:.0f}")
+                secondary_metrics.append(("Avg power", f"{avg_watts:.0f} W"))
+            if kjs is not None and pd.notna(kjs):
+                secondary_metrics.append(("Work", f"{kjs:.0f} kJ"))
+
+            render_metric_cards(primary_metrics, columns=4)
+            render_metric_cards(secondary_metrics)
 
         manual_overrides = load_activity_overrides().get(str(activity_id), {})
         if not isinstance(manual_overrides, dict):
             manual_overrides = {}
+        distance_override_default = (
+            f"{float(manual_overrides['distance']) / 1000.0:g}"
+            if manual_overrides.get("distance") is not None
+            else ""
+        )
+        moving_override_default = (
+            f"{float(manual_overrides['moving_time']) / 3600.0:g}"
+            if manual_overrides.get("moving_time") is not None
+            else ""
+        )
+        speed_override_default = (
+            f"{float(manual_overrides['average_speed']) * 3.6:g}"
+            if manual_overrides.get("average_speed") is not None
+            else ""
+        )
         elev_override_default = (
             f"{float(manual_overrides['total_elevation_gain']):g}"
             if manual_overrides.get("total_elevation_gain") is not None
@@ -1945,12 +2963,23 @@ def main():
             else ""
         )
         notes_override_default = str(manual_overrides.get("notes", "")).strip()
+        current_sport = str(act_row.get("sport", "Workout"))
+        sport_choices = _sport_options(selected_sports, current_sport)
+        sport_default_index = (
+            sport_choices.index(current_sport) if current_sport in sport_choices else 0
+        )
         current_elev = act_row.get("total_elevation_gain", None)
+        current_speed = _get_avg_speed_mps(act_row)
         current_power = act_row.get("average_watts", None)
         current_avg_hr = act_row.get("average_heartrate", None)
         current_elev_label = (
             f"{float(current_elev):.0f} m"
             if current_elev is not None and pd.notna(current_elev)
+            else "n/a"
+        )
+        current_speed_label = (
+            f"{current_speed * 3.6:.1f} km/h"
+            if current_speed is not None and pd.notna(current_speed)
             else "n/a"
         )
         current_power_label = (
@@ -1964,17 +2993,40 @@ def main():
             else "n/a"
         )
         if notes_override_default:
-            st.markdown("### Notes")
+            render_section_title("Notes")
             st.info(notes_override_default)
-        with st.expander("Manual activity data", expanded=False):
+        with st.expander("Edit activity data", expanded=False):
             st.caption(
                 "Saved in `activity_overrides.json` and applied across summaries/charts."
             )
             st.caption(
                 "Current values shown: "
-                f"elevation {current_elev_label}, avg power {current_power_label}, avg HR {current_hr_label}."
+                f"type {current_sport}, distance {distance_km:.1f} km, "
+                f"moving time {moving_h:.2f} h, speed {current_speed_label}, "
+                f"elevation {current_elev_label}, "
+                f"avg power {current_power_label}, avg HR {current_hr_label}."
             )
             with st.form(key=f"manual_data_form_{activity_id}"):
+                sport_input = st.selectbox(
+                    "Activity type",
+                    sport_choices,
+                    index=sport_default_index,
+                )
+                distance_input = st.text_input(
+                    "Distance override (km)",
+                    value=distance_override_default,
+                    placeholder="Leave blank to remove override",
+                )
+                moving_input = st.text_input(
+                    "Moving time override (h)",
+                    value=moving_override_default,
+                    placeholder="Leave blank to remove override",
+                )
+                speed_input = st.text_input(
+                    "Average speed override (km/h)",
+                    value=speed_override_default,
+                    placeholder="Leave blank to derive from distance and time",
+                )
                 elev_input = st.text_input(
                     "Elevation gain override (m)",
                     value=elev_override_default,
@@ -2002,6 +3054,9 @@ def main():
 
             if save_clicked:
                 try:
+                    distance_value = parse_optional_float(distance_input)
+                    moving_value = parse_optional_float(moving_input)
+                    speed_value = parse_optional_float(speed_input)
                     elev_value = parse_optional_float(elev_input)
                     power_value = parse_optional_float(power_input)
                     hr_value = parse_optional_float(hr_input)
@@ -2011,9 +3066,25 @@ def main():
                     save_activity_overrides(
                         activity_id,
                         {
+                            "distance": (
+                                distance_value * 1000.0
+                                if distance_value is not None
+                                else None
+                            ),
+                            "moving_time": (
+                                moving_value * 3600.0
+                                if moving_value is not None
+                                else None
+                            ),
+                            "average_speed": (
+                                speed_value / 3.6
+                                if speed_value is not None
+                                else None
+                            ),
                             "total_elevation_gain": elev_value,
                             "average_watts": power_value,
                             "average_heartrate": hr_value,
+                            "sport": sport_input,
                             "notes": notes_input,
                         },
                     )
@@ -2025,9 +3096,13 @@ def main():
                 save_activity_overrides(
                     activity_id,
                     {
+                        "distance": None,
+                        "moving_time": None,
+                        "average_speed": None,
                         "total_elevation_gain": None,
                         "average_watts": None,
                         "average_heartrate": None,
+                        "sport": None,
                         "notes": None,
                     },
                 )
@@ -2035,7 +3110,15 @@ def main():
                 st.success("Manual overrides cleared.")
                 st.rerun()
 
-        st.markdown("### Map + data plots")
+        if str(act_row.get("source", "")).lower() == "manual":
+            if st.button("Delete manual activity", key=f"delete_manual_activity_{activity_id}"):
+                if delete_manual_activity(activity_id):
+                    load_activities.clear()
+                    st.session_state["selected_activity_id"] = None
+                    st.success("Manual activity deleted.")
+                    st.rerun()
+
+        render_section_title("Map and data")
         t_hr, hr = load_hr_stream(activity_id)
         t_power, power = load_power_stream(activity_id)
         gpx_times, gpx_lats, gpx_lons = None, None, None
@@ -2068,7 +3151,7 @@ def main():
                 elev_t=elev_t,
                 elev=elev,
             )
-            html(interactive_html, height=560, scrolling=False)
+            html(interactive_html, height=590, scrolling=False)
         else:
             if gpx_error:
                 st.info(f"Map unavailable for this activity ({gpx_error}).")
@@ -2089,7 +3172,7 @@ def main():
                 [activity_id], zones, activities_df=day_df
             )
             if sum(zone_totals.values()) > 0:
-                st.markdown("### HR zones")
+                render_section_title("HR zones")
                 zone_df = build_zone_chart_df(zone_totals, zones)
                 st.vega_lite_chart(
                     zone_df,
@@ -2121,6 +3204,273 @@ def main():
                 if avg_only_count:
                     st.caption(
                         "Time in zones is calculated from average heart rate only."
+                    )
+
+    if view == "Training plan":
+        render_view_header("Training plan")
+        st.caption(f"Source: `{TRAINING_PLAN_CSV_PATH}`")
+
+        try:
+            plan_df = load_training_plan()
+        except Exception as exc:
+            st.error(f"Could not load training plan CSV: {exc}")
+            return
+
+        if plan_df.empty:
+            st.info("Training plan file is empty.")
+            return
+
+        if "row_type" in plan_df.columns:
+            week_summary_df = plan_df[plan_df["row_type"].astype(str) == "week_summary"].copy()
+            session_df = plan_df[plan_df["row_type"].astype(str) == "session"].copy()
+        else:
+            week_summary_df = plan_df.copy()
+            session_df = plan_df.copy()
+
+        week_options = (
+            week_summary_df["iso_week"].dropna().astype(int).drop_duplicates().sort_values().tolist()
+            if "iso_week" in week_summary_df.columns
+            else []
+        )
+        if not week_options:
+            st.warning("No week entries (`iso_week`) found in the training plan.")
+            st.dataframe(plan_df, width='stretch', hide_index=True)
+            return
+
+        default_week = None
+        if "week_pick" in st.session_state:
+            try:
+                default_week = int(st.session_state["week_pick"].isocalendar().week)
+            except Exception:
+                default_week = None
+        if default_week not in week_options:
+            default_week = week_options[0]
+
+        selected_week = st.selectbox(
+            "ISO week",
+            week_options,
+            index=week_options.index(default_week),
+            key="training_plan_week_select",
+        )
+
+        selected_week_summary = week_summary_df[week_summary_df["iso_week"].astype("Int64") == selected_week].copy()
+        selected_week_sessions = session_df[session_df["iso_week"].astype("Int64") == selected_week].copy()
+
+        if not selected_week_summary.empty:
+            top = selected_week_summary.iloc[0]
+            render_metric_cards(
+                [
+                    ("Phase", str(top.get("phase", ""))),
+                    ("Week start", str(top.get("week_start", ""))),
+                    ("Weekly hours", f"{float(top.get('weekly_total_hours', 0) or 0):.2f} h"),
+                    ("Sessions", f"{int(top.get('weekly_total_sessions', 0) or 0)}"),
+                ],
+                columns=4,
+            )
+
+            focus = str(top.get("weekly_focus", "")).strip()
+            if focus and focus.lower() != "nan":
+                st.info(focus)
+            notes = str(top.get("notes", "")).strip()
+            if notes and notes.lower() != "nan":
+                st.caption(notes)
+
+        if selected_week_sessions.empty:
+            st.info("No session rows found for this week.")
+        else:
+            if "session_order" in selected_week_sessions.columns:
+                selected_week_sessions = selected_week_sessions.sort_values("session_order")
+
+            render_section_title("Week sessions")
+            show_cols = [
+                c
+                for c in [
+                    "day",
+                    "session_name",
+                    "sport",
+                    "duration_min",
+                    "intensity",
+                    "vertical_target_m",
+                    "session_description",
+                ]
+                if c in selected_week_sessions.columns
+            ]
+            st.dataframe(
+                selected_week_sessions[show_cols],
+                width='stretch',
+                hide_index=True,
+            )
+
+            week_edit_df = plan_df[plan_df["iso_week"].astype("Int64") == selected_week].copy()
+            with st.expander("Edit week (all fields)", expanded=False):
+                st.caption("Edit any field for this week, then click Save week changes.")
+                week_edit_source = week_edit_df.copy().fillna("")
+                for col in week_edit_source.columns:
+                    week_edit_source[col] = week_edit_source[col].astype(str)
+
+                preferred_order = [
+                    "row_type",
+                    "day",
+                    "session_order",
+                    "session_name",
+                    "sport",
+                    "duration_min",
+                    "intensity",
+                    "vertical_target_m",
+                    "session_description",
+                    "iso_week",
+                    "week_start",
+                    "week_end",
+                    "phase",
+                    "weekly_focus",
+                    "weekly_total_hours",
+                    "weekly_total_minutes",
+                    "weekly_run_sessions",
+                    "weekly_strength_sessions",
+                    "weekly_cross_sessions",
+                    "weekly_total_sessions",
+                    "plan_name",
+                    "main_objective",
+                    "notes",
+                ]
+                column_order = [c for c in preferred_order if c in week_edit_source.columns]
+                column_order += [c for c in week_edit_source.columns if c not in column_order]
+
+                with st.form("training_plan_week_edit_form", clear_on_submit=False):
+                    editable_week_df = st.data_editor(
+                        week_edit_source,
+                        width='stretch',
+                        hide_index=True,
+                        num_rows="fixed",
+                        key=f"training_plan_week_editor_{selected_week}",
+                        disabled=False,
+                        column_order=column_order,
+                    )
+                    save_week_clicked = st.form_submit_button(
+                        "Save week changes",
+                        type="primary",
+                        use_container_width=True,
+                    )
+
+                if save_week_clicked:
+                    try:
+                        # Persist week edits as object-typed values first to avoid
+                        # pandas dtype-assignment warnings on mixed text/numeric input.
+                        plan_updated = plan_df.copy().astype("object")
+                        editable_week_df = (
+                            editable_week_df.reindex(columns=plan_updated.columns)
+                            .astype("object")
+                        )
+                        plan_updated.loc[
+                            week_edit_df.index, plan_updated.columns
+                        ] = editable_week_df.to_numpy(dtype=object)
+                        save_training_plan(plan_updated)
+                        load_training_plan.clear()
+                        st.success(f"Week {selected_week} saved.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not save week changes: {exc}")
+
+        render_section_title("Target graphs")
+        if session_df.empty:
+            st.info("No session rows available to build target graphs.")
+        else:
+            chart_year = date.today().year
+            if "week_start" in week_summary_df.columns:
+                non_null_week_starts = week_summary_df["week_start"].dropna()
+                if not non_null_week_starts.empty:
+                    chart_year = int(non_null_week_starts.iloc[0].year)
+
+            sessions_for_graph = session_df.copy()
+            sessions_for_graph["duration_min"] = (
+                pd.to_numeric(sessions_for_graph.get("duration_min"), errors="coerce")
+                .fillna(0.0)
+            )
+            sessions_for_graph["duration_h"] = sessions_for_graph["duration_min"] / 60.0
+            sessions_for_graph["iso_week"] = (
+                pd.to_numeric(sessions_for_graph.get("iso_week"), errors="coerce")
+                .astype("Int64")
+            )
+            sessions_for_graph = sessions_for_graph.dropna(subset=["iso_week"]).copy()
+            sessions_for_graph["week"] = sessions_for_graph["iso_week"].astype(int)
+
+            weekly_target = (
+                sessions_for_graph.groupby("week", as_index=False)
+                .agg(time_h=("duration_h", "sum"), sessions=("session_name", "count"))
+                .sort_values("week")
+            )
+
+            if "sport" in sessions_for_graph.columns:
+                sessions_for_graph["sport_bucket"] = sessions_for_graph["sport"].apply(
+                    lambda s: _resolve_sport_bucket(str(s), ["Running", "Biking", "Weight training", "Other"])
+                )
+            else:
+                sessions_for_graph["sport_bucket"] = "Other"
+
+            by_sport_week = (
+                sessions_for_graph.groupby(["week", "sport_bucket"], as_index=False)["duration_h"]
+                .sum()
+                .rename(columns={"duration_h": "time_h"})
+            )
+            by_sport_wide = (
+                by_sport_week.pivot(index="week", columns="sport_bucket", values="time_h")
+                .fillna(0.0)
+                .sort_index()
+            )
+            sport_order = [c for c in ["Running", "Biking", "Weight training", "Other"] if c in by_sport_wide.columns]
+
+            st.markdown("**Weekly target hours**")
+            _render_weekly_chart(
+                _weekly_area_point_chart(weekly_target, "time_h", "Hours", 220),
+                key=f"plan_weekly_hours_{chart_year}",
+                year=chart_year,
+                supports_select=True,
+            )
+
+            st.markdown("**Weekly target sessions**")
+            _render_weekly_chart(
+                _weekly_area_point_chart(weekly_target, "sessions", "Sessions", 180),
+                key=f"plan_weekly_sessions_{chart_year}",
+                year=chart_year,
+                supports_select=True,
+            )
+
+            if not by_sport_week.empty:
+                st.markdown("**Weekly target hours by sport**")
+                stack_chart = (
+                    alt.Chart(by_sport_week)
+                    .mark_area(opacity=0.35)
+                    .encode(
+                        x=alt.X("week:Q", title="Week of year"),
+                        y=alt.Y("time_h:Q", title="Hours"),
+                        color=alt.Color("sport_bucket:N", title="Sport"),
+                        tooltip=[
+                            alt.Tooltip("week:Q", title="Week"),
+                            alt.Tooltip("sport_bucket:N", title="Sport"),
+                            alt.Tooltip("time_h:Q", title="Hours"),
+                        ],
+                    )
+                    .properties(height=220)
+                )
+                st.altair_chart(stack_chart, width='stretch')
+
+                totals_by_sport = by_sport_week.groupby("sport_bucket")["time_h"].sum().to_dict()
+                render_metric_cards(
+                    [
+                        (f"{label} target", f"{float(totals_by_sport.get(label, 0.0)):.2f} h")
+                        for label in sport_order
+                    ],
+                    columns=max(1, min(4, len(sport_order))),
+                )
+
+                for sport_label in sport_order:
+                    sport_week_df = by_sport_wide[[sport_label]].reset_index().rename(columns={sport_label: "time_h"})
+                    st.markdown(f"**{sport_label} target hours**")
+                    _render_weekly_chart(
+                        _weekly_area_point_chart(sport_week_df, "time_h", "Hours", 150),
+                        key=f"plan_weekly_{sport_label}_{chart_year}",
+                        year=chart_year,
+                        supports_select=True,
                     )
 
     if view == "Year overview":
@@ -2166,14 +3516,18 @@ def main():
             )
         year_df = year_bundle["year_df"]
 
-        st.subheader(f"Year summary {year}")
+        render_view_header("Year overview", str(year))
         if year_bundle["empty"]:
             st.info("No activities for this year with selected sports.")
         else:
-            y1, y2, y3 = st.columns(3)
-            y1.metric("Total time (h)", f"{year_bundle['total_time_h']:.2f}")
-            y2.metric("Total distance (km)", f"{year_bundle['total_distance_km']:.1f}")
-            y3.metric("Total elevation gain (m)", f"{year_bundle['total_elev_m']:.0f}")
+            render_metric_cards(
+                [
+                    ("Total time", f"{year_bundle['total_time_h']:.2f} h"),
+                    ("Total distance", f"{year_bundle['total_distance_km']:.1f} km"),
+                    ("Elevation gain", f"{year_bundle['total_elev_m']:.0f} m"),
+                ],
+                columns=3,
+            )
 
             zones = year_bundle["zones"]
             if not zones:
@@ -2187,7 +3541,7 @@ def main():
                 else:
                     chart_df = build_zone_chart_df(zone_totals, zones).copy()
                     chart_df["zone"] = chart_df["label"]
-                    st.markdown("### Time in HR zones")
+                    render_section_title("Time in HR zones")
                     st.vega_lite_chart(
                         chart_df,
                         {
@@ -2224,22 +3578,23 @@ def main():
                         st.caption(
                             "Some zone times are estimated from average heart rate only."
                         )
-            st.markdown("### Hours by sport")
+            render_section_title("Hours by sport")
             sport_order = year_bundle["sport_order"]
             totals_by_sport = year_bundle["totals_by_sport"]
             totals_km_by_sport = year_bundle["totals_km_by_sport"]
 
-            cols = st.columns(3)
-            for idx, label in enumerate(sport_order):
+            sport_metrics = []
+            for label in sport_order:
                 hours_val = totals_by_sport[label]
                 if label in {"Running", "Trail running", "Biking"}:
                     km_val = totals_km_by_sport[label]
                     value = f"{hours_val:.2f} ({km_val:.1f} km)"
                 else:
                     value = f"{hours_val:.2f}"
-                cols[idx % 3].metric(label, value)
+                sport_metrics.append((label, value))
+            render_metric_cards(sport_metrics, columns=3)
 
-            st.markdown("### Weekly hours by sport")
+            render_section_title("Weekly hours by sport")
             all_sports_week = year_bundle["all_sports_week"]
             elev_week = year_bundle["elev_week"]
 

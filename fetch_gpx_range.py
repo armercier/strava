@@ -5,14 +5,12 @@ from pathlib import Path
 from typing import Set
 
 import pandas as pd
-import requests
-
-from strava_tracks import export_gpx_for_activity
+from garmin_tracks import export_gpx_for_activity
 
 """
 fetch_gpx_range.py
 
-Fetch GPX files for a filtered set of Strava activities. This script only
+Fetch GPX files for a filtered set of activities. This script only
 downloads GPX files (caching on disk) and does not build a map.
 
 Configure FETCH_DAYS_BACK independently from any mapping script to control
@@ -20,7 +18,7 @@ how far back you want to sync activities.
 """
 
 # --------- CONFIG ---------
-CSV_PATH = Path("activities_clean.csv")   # Strava activities CSV export
+CSV_PATH = Path("activities_clean.csv")   # combined activities CSV export
 GPX_DIR = Path("gpx")                     # where GPX files will be stored
 
 TARGET_SPORTS: Set[str] = {
@@ -120,21 +118,8 @@ def fetch_gpx_for_range(
                 print("  -> skipped (no GPS in streams)")
                 continue
             raise
-        except requests.HTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            if status == 404:
-                print("  -> skipped (Strava returned 404)")
-                continue
-            if status == 429:
-                print("  -> hit Strava rate limit (429). Stopping further requests.")
-                break
-            if status is None or (isinstance(status, int) and status >= 500):
-                print(f"  -> skipped (Strava error {status or 'unknown'})")
-                continue
-            print(f"  -> skipped (HTTP error {status})")
-            continue
-        except requests.RequestException as e:
-            print(f"  -> skipped (request error: {e})")
+        except Exception as e:
+            print(f"  -> skipped (download error: {e})")
             continue
 
     print(f"Done. Downloaded {fetched}, cached {skipped_cached}, total considered {len(df)}.")

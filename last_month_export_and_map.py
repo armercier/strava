@@ -9,8 +9,8 @@ import gpxpy
 import folium
 import requests
 
-# Import your existing GPX export function from your Strava module
-from strava_tracks import export_gpx_for_activity  # adjust name if needed
+# Import your existing GPX export function from Garmin-backed module
+from garmin_tracks import export_gpx_for_activity
 
 
 """

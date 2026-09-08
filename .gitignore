@@ -2,6 +2,10 @@
 gpx/
 hr_streams/
 power_streams/
+garmin_probe_output/
+garmin_activity_details/
+garmin_originals/
+fit_files/
 
 # .pyc files
 *.pyc

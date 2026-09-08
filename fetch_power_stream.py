@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Set
-import time
 
 import pandas as pd
-import requests
 
-from strava_config import load_client_credentials
+from garmin_streams import fetch_power_stream as fetch_garmin_power_stream
 
 # --------- CONFIG ---------
 TOKEN_PATH = Path("strava_tokens.json")
@@ -37,68 +34,10 @@ TARGET_SPORTS: Set[str] = {
 # --------------------------
 
 
-CLIENT_ID, CLIENT_SECRET = load_client_credentials()
-
-
-def load_tokens():
-    return json.loads(TOKEN_PATH.read_text())
-
-
-def save_tokens(tokens):
-    TOKEN_PATH.write_text(json.dumps(tokens, indent=2))
-
-
-def refresh_access_token(tokens):
-    now = int(time.time())
-    if tokens["expires_at"] > now + 60:
-        return tokens["access_token"], tokens
-
-    url = "https://www.strava.com/oauth/token"
-    payload = {
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "grant_type": "refresh_token",
-        "refresh_token": tokens["refresh_token"],
-    }
-    resp = requests.post(url, data=payload)
-    resp.raise_for_status()
-    data = resp.json()
-
-    tokens["access_token"] = data["access_token"]
-    tokens["refresh_token"] = data["refresh_token"]
-    tokens["expires_at"] = data["expires_at"]
-    save_tokens(tokens)
-    return tokens["access_token"], tokens
-
-
 def fetch_power_stream(activity_id: int):
-    tokens = load_tokens()
-    access_token, _ = refresh_access_token(tokens)
-
-    url = f"https://www.strava.com/api/v3/activities/{activity_id}/streams"
-    params = {
-        "keys": "watts,time",
-        "key_by_type": "true",
-    }
-    headers = {"Authorization": f"Bearer {access_token}"}
-
-    resp = requests.get(url, params=params, headers=headers)
-    try:
-        resp.raise_for_status()
-    except requests.HTTPError as e:
-        status = getattr(resp, "status_code", None)
-        raise requests.HTTPError(
-            f"Failed to fetch power stream for {activity_id} (status {status})",
-            response=resp,
-        ) from e
-
-    streams = resp.json()
-    try:
-        time_s = streams["time"]["data"]
-        watts = streams["watts"]["data"]
-    except KeyError as e:
-        # Stream missing (e.g., no power recorded). Raise for caller to handle.
-        raise KeyError(f"Power stream missing for activity {activity_id}") from e
+    time_s, watts = fetch_garmin_power_stream(activity_id)
+    if not time_s or not watts:
+        raise KeyError(f"Power stream missing for activity {activity_id}")
     return time_s, watts
 
 
@@ -199,21 +138,8 @@ def fetch_power_streams_for_range(
             print(f"  -> skipped (no power stream: {e})")
             skipped += 1
             continue
-        except requests.HTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            if status == 404:
-                print("  -> skipped (404 not found)")
-            elif status == 429:
-                print("  -> hit Strava rate limit (429). Stopping further requests.")
-                break
-            elif status is None or (isinstance(status, int) and status >= 500):
-                print(f"  -> skipped (Strava error {status or 'unknown'})")
-            else:
-                print(f"  -> skipped (HTTP error {status})")
-            skipped += 1
-            continue
-        except requests.RequestException as e:
-            print(f"  -> skipped (request error: {e})")
+        except Exception as e:
+            print(f"  -> skipped (stream error: {e})")
             skipped += 1
             continue
 

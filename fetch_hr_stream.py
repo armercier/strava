@@ -1,11 +1,8 @@
-import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Set
-import time
 
 import pandas as pd
-import requests
 
 """
 fetch_hr_stream.py
@@ -86,10 +83,8 @@ Notes & edge cases
 """
 
 
-from strava_config import load_client_credentials
+from garmin_streams import fetch_hr_stream as fetch_garmin_hr_stream
 
-
-CLIENT_ID, CLIENT_SECRET = load_client_credentials()
 
 TOKEN_PATH = Path("strava_tokens.json")
 HR_DIR = Path("hr_streams")
@@ -115,68 +110,8 @@ TARGET_SPORTS: Set[str] = {
 }
 
 
-def load_tokens():
-    return json.loads(TOKEN_PATH.read_text())
-
-
-def save_tokens(tokens):
-    TOKEN_PATH.write_text(json.dumps(tokens, indent=2))
-
-
-def refresh_access_token(tokens):
-    now = int(time.time())
-    if tokens["expires_at"] > now + 60:
-        return tokens["access_token"], tokens
-
-    url = "https://www.strava.com/oauth/token"
-    payload = {
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "grant_type": "refresh_token",
-        "refresh_token": tokens["refresh_token"],
-    }
-    resp = requests.post(url, data=payload)
-    resp.raise_for_status()
-    data = resp.json()
-
-    tokens["access_token"] = data["access_token"]
-    tokens["refresh_token"] = data["refresh_token"]
-    tokens["expires_at"] = data["expires_at"]
-    save_tokens(tokens)
-    return tokens["access_token"], tokens
-
-
 def fetch_hr_stream(activity_id: int):
-    tokens = load_tokens()
-    access_token, _ = refresh_access_token(tokens)
-
-    url = f"https://www.strava.com/api/v3/activities/{activity_id}/streams"
-    params = {
-        "keys": "heartrate,time",
-        "key_by_type": "true",
-    }
-    headers = {"Authorization": f"Bearer {access_token}"}
-
-    resp = requests.get(url, params=params, headers=headers)
-    try:
-        resp.raise_for_status()
-    except requests.HTTPError as e:
-        status = getattr(resp, "status_code", None)
-        raise requests.HTTPError(
-            f"Failed to fetch HR stream for {activity_id} (status {status})",
-            response=resp,
-        ) from e
-    streams = resp.json()
-
-    # streams is a dict like:
-    # {
-    #   "time": {"data": [0, 1, 2, ...], "type": "time", ...},
-    #   "heartrate": {"data": [100, 101, 102, ...], "type": "heartrate", ...}
-    # }
-
-    time_s = streams["time"]["data"]
-    hr_bpm = streams["heartrate"]["data"]
-    return time_s, hr_bpm
+    return fetch_garmin_hr_stream(activity_id)
 
 
 def get_hr_stream_cached(activity_id: int, use_cache: bool = True):
@@ -243,16 +178,9 @@ def load_and_filter_activities(start_days_ago: int, end_days_ago: int) -> pd.Dat
     else:
         hr_mask = True  # keep all if no HR indicator column is present
 
-    # Avoid API calls when watt data is absent in the CSV.
-    if "average_watts" in df.columns:
-        power_mask = df["average_watts"].notna()
-    else:
-        power_mask = True
-
     mask = (
         df[sport_col].isin(TARGET_SPORTS)
         & hr_mask
-        & power_mask
         & df["activity_date"].between(window_start, window_end)
     )
     sub = df.loc[mask, ["id", sport_col, "activity_date"]].copy()
@@ -292,21 +220,8 @@ def fetch_hr_streams_for_range(
             else:
                 fetched += 1
                 print(f"  -> saved {path.name}")
-        except requests.HTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            if status == 404:
-                print("  -> skipped (404 not found)")
-            elif status == 429:
-                print("  -> hit Strava rate limit (429). Stopping further requests.")
-                break
-            elif status is None or (isinstance(status, int) and status >= 500):
-                print(f"  -> skipped (Strava error {status or 'unknown'})")
-            else:
-                print(f"  -> skipped (HTTP error {status})")
-            skipped += 1
-            continue
-        except requests.RequestException as e:
-            print(f"  -> skipped (request error: {e})")
+        except Exception as e:
+            print(f"  -> skipped (stream error: {e})")
             skipped += 1
             continue
 
